@@ -56,6 +56,7 @@ export class StatsRecorder {
     this.countersDay = null;     // the day whose counters are actually held in memory
     this.counters = emptyCounters();
     this.firstObservedAt = null;
+    this.lastObservedAt = null;
 
     this.chain = Promise.resolve();
     this.timer = null;
@@ -110,6 +111,7 @@ export class StatsRecorder {
       const saved = JSON.parse(await readFile(this.countersFile(today), 'utf8'));
       this.counters = { ...emptyCounters(), ...saved.counters };
       this.firstObservedAt = saved.firstObservedAt || null;
+      this.lastObservedAt = saved.lastObservedAt || null;
       this.currentDay = today;
       this.countersDay = today;
     } catch { /* no counters yet today */ }
@@ -134,6 +136,7 @@ export class StatsRecorder {
     this.countersDay = day;
     this.counters = emptyCounters();
     this.firstObservedAt = null;
+    this.lastObservedAt = null;
 
     // Seed the new day with every store that is still available, so its file stands alone.
     const startIso = new Date(dayStart(day)).toISOString();
@@ -177,6 +180,9 @@ export class StatsRecorder {
     const t = Number.isFinite(Date.parse(fetchedAt)) ? Date.parse(fetchedAt) : this.now();
     const day = this.rollover(t);
     if (!this.firstObservedAt) this.firstObservedAt = new Date(t).toISOString();
+    // Liveness: when the upstream was last actually read (not when the page was opened).
+    if (!this.lastObservedAt || t > Date.parse(this.lastObservedAt)) this.lastObservedAt = new Date(t).toISOString();
+    this.scheduleFlush();
     const emitted = [];
 
     for (const store of stores) {
@@ -241,7 +247,7 @@ export class StatsRecorder {
 
   persistCounters(day) {
     if (day !== this.countersDay) return this.chain;
-    const body = JSON.stringify({ day, counters: this.counters, firstObservedAt: this.firstObservedAt, savedAt: new Date(this.now()).toISOString() });
+    const body = JSON.stringify({ day, counters: this.counters, firstObservedAt: this.firstObservedAt, lastObservedAt: this.lastObservedAt, savedAt: new Date(this.now()).toISOString() });
     const file = this.countersFile(day);
     this.chain = this.chain.then(() => atomicWrite(file, body)).catch(error => {
       this.health.writeErrors += 1;
@@ -305,16 +311,17 @@ export class StatsRecorder {
   }
 
   async readCounters(day) {
-    if (day === this.countersDay) return { counters: { ...this.counters }, firstObservedAt: this.firstObservedAt };
+    if (day === this.countersDay) return { counters: { ...this.counters }, firstObservedAt: this.firstObservedAt, lastObservedAt: this.lastObservedAt };
     try {
       const saved = JSON.parse(await readFile(this.countersFile(day), 'utf8'));
-      return { counters: { ...emptyCounters(), ...saved.counters }, firstObservedAt: saved.firstObservedAt || null };
+      return { counters: { ...emptyCounters(), ...saved.counters }, firstObservedAt: saved.firstObservedAt || null, lastObservedAt: saved.lastObservedAt || null };
     } catch {
-      return { counters: emptyCounters(), firstObservedAt: null };
+      return { counters: emptyCounters(), firstObservedAt: null, lastObservedAt: null };
     }
   }
 
   async availableDays() {
+    await this.chain;            // a day file created by a pending append must be listed
     const days = new Set();
     try {
       for (const name of await readdir(this.dir)) {
@@ -324,6 +331,36 @@ export class StatsRecorder {
     } catch { /* no dir */ }
     if (this.currentDay) days.add(this.currentDay);
     return [...days].sort().reverse();
+  }
+
+  /**
+   * Most recent arrival for a product on or before `beforeDay`, searching newest day first.
+   * Lets an empty day still answer "when did stock last show up?".
+   */
+  async lastArrival(product, beforeDay = null) {
+    const days = (await this.availableDays()).filter(day => !beforeDay || day <= beforeDay);
+    for (const day of days) {
+      const ups = (await this.readEvents(day)).filter(e => e.type === 'up' && e.product === product);
+      if (ups.length) {
+        const last = ups.reduce((a, b) => (Date.parse(b.t) > Date.parse(a.t) ? b : a));
+        return { day, t: last.t, sku: last.sku, storeName: last.storeName, region: last.region, capacity: last.capacity, colorLabel: last.colorLabel };
+      }
+    }
+    return null;
+  }
+
+  /** What is currently being tracked for a product: distinct configs, stores and cities. */
+  coverage(product) {
+    const configs = new Set(), stores = new Set(), regions = new Set();
+    for (const key of this.state.keys()) {
+      const [sku, storeId] = key.split('|');
+      if (this.skuIndex.get(sku)?.product !== product) continue;
+      configs.add(sku);
+      stores.add(storeId);
+      const region = this.describe(sku, storeId).region;
+      if (region) regions.add(region);
+    }
+    return { configs: configs.size, stores: stores.size, regions: regions.size };
   }
 
   snapshot() {

@@ -875,6 +875,25 @@ await test('跨日时仍有货的门店写入 carry，且不覆盖昨天的计�
   const y = JSON.parse(await readFile(join(dir, 's6', 'counters-2026-09-18.json'), 'utf8'));
   assert.equal(y.counters.monitorRounds, 7, '昨天的计数不得被清零覆盖');
 });
+await test('记录最近一次检查时间，并能找到最近一次到货', async () => {
+  const clock = fakeClock(Date.parse('2026-09-12T20:00:00+08:00'));
+  const rec = await recorderAt('s8', clock);
+  const obs = (iso, status) => rec.observe({ sku: 'MJY74CH/A', regionId: 'beijing', stores: [store('R320', status)], fetchedAt: iso });
+  obs('2026-09-12T20:00:00+08:00', 'unavailable');
+  obs('2026-09-12T20:31:00+08:00', 'available');
+  clock.set(Date.parse('2026-09-13T13:40:00+08:00'));
+  obs('2026-09-13T13:40:00+08:00', 'available');
+  assert.equal(rec.lastObservedAt, new Date('2026-09-13T13:40:00+08:00').toISOString());
+  const last = await rec.lastArrival('iphone-18-pro-max', '2026-09-13');
+  assert.equal(last.day, '2026-09-12', '今天只有 carry 没有新的到货，应回溯到昨天');
+  assert.equal(last.t, new Date('2026-09-12T20:31:00+08:00').toISOString());
+  assert.equal(await rec.lastArrival('iphone-duo', '2026-09-13'), null);
+  assert.deepEqual(rec.coverage('iphone-18-pro-max'), { configs: 1, stores: 1, regions: 1 });
+  assert.deepEqual(rec.coverage('iphone-duo'), { configs: 0, stores: 0, regions: 0 });
+  await rec.close();
+  const saved = JSON.parse(await readFile(join(dir, 's8', 'counters-2026-09-13.json'), 'utf8'));
+  assert.ok(saved.lastObservedAt, '最近检查时间要落盘');
+});
 await test('在新的一天启动的进程不会用空计数覆盖昨天', async () => {
   const clock = fakeClock(Date.parse('2026-09-18T20:00:00+08:00'));
   const rec = await recorderAt('s7', clock);

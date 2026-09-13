@@ -15,7 +15,7 @@
 .st[aria-busy="true"] .st-body { opacity: .55; transition: opacity .2s var(--ease); }
 
 /* ---- header ---- */
-.st-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+.st-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; padding-bottom: 6px; }
 .st-head h1 { font-size: 32px; font-weight: 700; letter-spacing: -.035em; line-height: 1.1; }
 .st-product > button { padding: 7px 16px; font-size: 14px; font-weight: 500; white-space: nowrap; }
 
@@ -40,9 +40,31 @@
 .metric .big.good { color: var(--green-ink); }
 .metric .sub { font-size: 13px; color: var(--label-3); }
 
-.st-empty { padding: 56px 24px; display: grid; justify-items: center; gap: 12px; color: var(--label-3); }
-.st-empty svg { width: 28px; height: 28px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; }
-.st-empty strong { font-size: 15px; font-weight: 500; color: var(--label-2); }
+/* ---- quiet state: nothing arrived ---- */
+.quiet { padding: 36px 36px 32px; border-radius: var(--r-xl); display: grid; gap: 14px; justify-items: start; }
+.quiet-status { display: inline-flex; align-items: center; gap: 10px; font-size: 14px; color: var(--label-2); padding-left: 1px; }
+.beacon { position: relative; width: 9px; height: 9px; border-radius: 50%; background: var(--label-4); flex: none; }
+.beacon.live { background: var(--green); }
+.beacon.live::after {
+  content: ""; position: absolute; inset: -5px; border-radius: 50%;
+  background: var(--green); opacity: .3; animation: ping 2.4s var(--ease) infinite;
+}
+.quiet h2 { font-size: 34px; font-weight: 700; letter-spacing: -.035em; line-height: 1.15; }
+.quiet-facts { margin: 8px 0 0; display: flex; flex-wrap: wrap; gap: 14px 0; }
+.quiet-facts > div { display: grid; gap: 3px; padding: 0 28px; border-left: 1px solid var(--separator); }
+.quiet-facts > div:first-child { padding-left: 0; border-left: 0; }
+.quiet-facts dt { font-size: 13px; color: var(--label-3); }
+.quiet-facts dd { margin: 0; font-size: 17px; font-weight: 600; letter-spacing: -.02em; color: var(--label); }
+.quiet-facts dd small { font-size: 13px; font-weight: 400; color: var(--label-2); margin-left: 6px; letter-spacing: 0; }
+.jump {
+  border: 0; background: none; padding: 0; font: inherit; color: var(--accent); text-align: left; letter-spacing: inherit;
+}
+.jump:hover { text-decoration: underline; text-underline-offset: 3px; }
+.quiet-action {
+  margin-top: 6px; height: 38px; padding: 0 18px; display: inline-flex; align-items: center;
+  border-radius: 999px; background: var(--accent); color: var(--on-accent); font-size: 15px; font-weight: 500;
+}
+.quiet-action:hover { background: var(--accent-hover); }
 
 /* ---- cards ---- */
 .st-body { display: grid; gap: 16px; }
@@ -152,6 +174,9 @@
   .metric:nth-child(n + 3) { border-top: 1px solid var(--separator); }
 }
 @media (max-width: 620px) {
+  .quiet { padding: 26px 20px 24px; }
+  .quiet h2 { font-size: 26px; }
+  .quiet-facts > div { padding: 0 18px; }
   .st { padding: 18px 12px 64px; gap: 12px; }
   .st-days { margin: 0 -12px; padding: 2px 12px; }
   .st-head h1 { font-size: 26px; }
@@ -163,5 +188,6 @@
   .rec-hour { top: 52px; }
 }
 @media (prefers-reduced-motion: reduce) {
+  .beacon.live::after { animation: none; }
   .st-tip, .st-chart .bar, .spinning svg { transition: none; animation: none; }
 }

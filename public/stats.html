@@ -40,10 +40,12 @@
 
     <section id="summary" class="st-summary panel" aria-label="概览"></section>
 
-    <div id="empty" class="st-empty panel" hidden>
-      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 20V11M12 20V5M19 20v-6"/></svg>
-      <strong>暂无数据</strong>
-    </div>
+    <section id="quiet" class="panel quiet" hidden aria-live="polite">
+      <div class="quiet-status"><span id="quietDot" class="beacon"></span><span id="quietChecked" class="num"></span></div>
+      <h2 id="quietTitle"></h2>
+      <dl id="quietFacts" class="quiet-facts"></dl>
+      <a id="quietAction" class="quiet-action" href="/" hidden>开启监控</a>
+    </section>
 
     <div id="body" class="st-body">
       <section class="panel st-chart-card" aria-labelledby="chartTitle">

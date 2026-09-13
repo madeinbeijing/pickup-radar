@@ -98,7 +98,8 @@ async function loadSummary({ silent = false } = {}) {
     if (state.region && !data.regionsSeen.includes(state.region)) state.region = '';
     syncUrl();
     renderAll();
-    if (data.hasData && !(silent && state.rows.length > PAGE)) await loadRecords({ reset: true });
+    const quiet = !data.hasData || (data.totals.ups === 0 && data.totals.downs === 0);
+    if (!quiet && !(silent && state.rows.length > PAGE)) await loadRecords({ reset: true });
   } catch (error) {
     if (RequestGuard.isAbort(error)) return;
     renderFailure();
@@ -140,20 +141,56 @@ async function loadRecords({ reset }) {
 function renderFailure() {
   $('#summary').hidden = true;
   $('#body').hidden = true;
-  $('#empty').hidden = false;
-  $('#empty strong').textContent = '加载失败';
+  $('#quiet').hidden = false;
+  $('#quietDot').className = 'beacon';
+  $('#quietChecked').textContent = '';
+  $('#quietTitle').textContent = '加载失败';
+  $('#quietFacts').innerHTML = '';
+  $('#quietAction').hidden = true;
+}
+
+const LIVE_MS = 3 * 60_000;       // a check this recent means monitoring is running
+const STALE_MS = 10 * 60_000;     // older than this, offer to turn monitoring on
+
+/** Nothing arrived: one calm status panel instead of a wall of zeros. */
+function renderQuiet(data) {
+  const isToday = state.day === todayKey();
+  const last = data.lastObservedAt ? Date.parse(data.lastObservedAt) : null;
+  const age = last == null ? Infinity : Date.now() - last;
+
+  $('#quietDot').className = `beacon${isToday && age <= LIVE_MS ? ' live' : ''}`;
+  $('#quietChecked').textContent = last == null ? '' : `最近检查 ${new Intl.DateTimeFormat('zh-CN', { timeZone: TZ, hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }).format(new Date(last))}`;
+  $('#quietTitle').textContent = !data.hasData
+    ? (isToday ? '今天还没有检查' : '当天没有检查')
+    : (isToday ? '今天还没有到货' : '当天没有到货');
+
+  const facts = [];
+  const { monitorRounds, pageQueries } = data.counters;
+  if (monitorRounds + pageQueries) {
+    facts.push(`<div><dt>刷新</dt><dd class="num">${n(monitorRounds + pageQueries)}<small>自动 ${n(monitorRounds)} · 手动 ${n(pageQueries)}</small></dd></div>`);
+  }
+  const cov = data.coverage;
+  if (isToday && cov && cov.stores) {
+    facts.push(`<div><dt>覆盖</dt><dd class="num">${n(cov.stores)}<small>家店 · ${n(cov.regions)} 个城市 · ${n(cov.configs)} 个配置</small></dd></div>`);
+  }
+  if (data.lastArrival) {
+    const a = data.lastArrival;
+    const when = `${a.day === todayKey() ? '' : `${dayLabel(a.day)} `}${hmFmt.format(new Date(a.t))}`;
+    facts.push(`<div><dt>上次到货</dt><dd><button type="button" class="jump" data-day="${a.day}" data-sku="${esc(a.sku)}" data-hour="${hourOf(a.t)}">${esc(when)}<small>${esc(a.capacity)} ${esc(a.colorLabel)} · ${esc(a.storeName)}</small></button></dd></div>`);
+  }
+  $('#quietFacts').innerHTML = facts.join('');
+  $('#quietAction').hidden = !(isToday && age > STALE_MS);
 }
 
 function renderAll() {
   const data = state.summary;
   renderDays(data);
   renderProducts(data);
-  const empty = !data.hasData;
-  $('#empty').hidden = !empty;
-  $('#empty strong').textContent = '暂无数据';
-  $('#summary').hidden = empty;
-  $('#body').hidden = empty;
-  if (empty) return;
+  const quiet = !data.hasData || (data.totals.ups === 0 && data.totals.downs === 0);
+  $('#quiet').hidden = !quiet;
+  $('#summary').hidden = quiet;
+  $('#body').hidden = quiet;
+  if (quiet) return renderQuiet(data);
   renderSummary(data);
   renderChart(data);
   renderConfigs(data);
@@ -163,6 +200,7 @@ function renderAll() {
 
 function renderDays(data) {
   const days = [...new Set([todayKey(), state.day, ...data.days])].sort().reverse();
+  $('#days').hidden = days.length < 2;   // a single "today" chip is not a choice
   $('#days').innerHTML = days.map(key =>
     `<button type="button" class="day" data-day="${key}" aria-current="${key === state.day}">${dayLabel(key)}</button>`
   ).join('');
@@ -184,16 +222,17 @@ function renderSummary(data) {
     `<dl class="metric"><dt>${label}</dt><dd class="big num ${cls}">${big}${unit ? `<small>${unit}</small>` : ''}</dd><dd class="sub">${sub}</dd></dl>`;
   $('#summary').innerHTML = [
     metric('刷新', n(counters.monitorRounds + counters.pageQueries), '次', `自动 ${n(counters.monitorRounds)} · 手动 ${n(counters.pageQueries)}`),
-    metric('到货', n(totals.ups), '次', `${n(totals.stores)} 家店`, totals.ups ? 'good' : ''),
+    metric('到货', n(totals.ups), '次', totals.stores ? `${n(totals.stores)} 家店` : '&nbsp;', totals.ups ? 'good' : ''),
     metric('售罄', n(totals.downs), '次', totals.avgDurationMin == null ? '&nbsp;' : `平均有货 ${Math.round(totals.avgDurationMin)} 分钟`),
     metric(isToday ? '现在有货' : '结束时有货', n(totals.storesAvailableNow), '家', '&nbsp;', totals.storesAvailableNow ? 'good' : '')
   ].join('');
 }
 
+/** Axis step for whole-number counts: never fractional, at most ~4 gridlines. */
 function niceStep(max) {
-  const raw = Math.max(1, max) / 4;
+  const raw = Math.max(1, max / 4);
   const pow = 10 ** Math.floor(Math.log10(raw));
-  return [1, 2, 5, 10].map(m => m * pow).find(s => s >= raw);
+  return Math.max(1, [1, 2, 5, 10].map(m => m * pow).find(s => s >= raw));
 }
 
 /** Column with rounded top corners and a flat base on the axis. */
@@ -414,6 +453,13 @@ $('#activeFilters').addEventListener('click', event => {
 });
 
 $('#recordsMore').addEventListener('click', () => loadRecords({ reset: false }));
+
+// Jump from the quiet panel straight to the most recent arrival.
+$('#quietFacts').addEventListener('click', event => {
+  const button = event.target.closest('.jump');
+  if (!button) return;
+  update({ day: button.dataset.day, sku: button.dataset.sku, hour: Number(button.dataset.hour), type: '', region: '' }, { summary: true });
+});
 $('#refreshButton').addEventListener('click', () => loadSummary());
 
 setInterval(() => {

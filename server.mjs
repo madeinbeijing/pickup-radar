@@ -334,11 +334,14 @@ async function handleApi(req, res, url) {
     const busiest = Object.entries(tally).sort((a, b) => b[1] - a[1])[0]?.[0];
     const product = requested || busiest || catalog.defaultProduct;
 
-    const { counters, firstObservedAt } = await stats.readCounters(day);
+    const { counters, firstObservedAt, lastObservedAt } = await stats.readCounters(day);
     const summary = summarize({ day, events, counters, firstObservedAt, product, catalog, now: Date.now() });
     return json(req, res, 200, {
       ok: true,
       ...summary,
+      lastObservedAt,
+      lastArrival: await stats.lastArrival(product, day),
+      coverage: stats.coverage(product),
       rankingTotal: summary.ranking.length,
       days: await stats.availableDays(),
       regionsSeen: [...new Set(events.filter(e => e.product === product).map(e => e.region).filter(Boolean))],
