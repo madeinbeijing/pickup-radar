@@ -1,0 +1,179 @@
+{
+  "verifiedAt": "2026-09-12T15:34:44.165Z",
+  "catalogVersion": "2.3.0",
+  "products": {
+    "iphone-18-pro-max": {
+      "source": "https://www.apple.com.cn/shop/buy-iphone/iphone-18-pro",
+      "colorMap": {
+        "glacier-blue": "glacier",
+        "burgundy": "burgundy",
+        "silver": "silver",
+        "black": "black"
+      },
+      "variants": [
+        {
+          "partNumber": "MJY64CH/A",
+          "price": 10999,
+          "capacity": "256GB",
+          "colorText": "Black"
+        },
+        {
+          "partNumber": "MJY74CH/A",
+          "price": 10999,
+          "capacity": "256GB",
+          "colorText": "Silver"
+        },
+        {
+          "partNumber": "MJY84CH/A",
+          "price": 10999,
+          "capacity": "256GB",
+          "colorText": "Burgundy"
+        },
+        {
+          "partNumber": "MJY94CH/A",
+          "price": 10999,
+          "capacity": "256GB",
+          "colorText": "Glacier"
+        },
+        {
+          "partNumber": "MJYA4CH/A",
+          "price": 12999,
+          "capacity": "512GB",
+          "colorText": "Black"
+        },
+        {
+          "partNumber": "MJYC4CH/A",
+          "price": 12999,
+          "capacity": "512GB",
+          "colorText": "Silver"
+        },
+        {
+          "partNumber": "MJYD4CH/A",
+          "price": 12999,
+          "capacity": "512GB",
+          "colorText": "Burgundy"
+        },
+        {
+          "partNumber": "MJYE4CH/A",
+          "price": 12999,
+          "capacity": "512GB",
+          "colorText": "Glacier"
+        },
+        {
+          "partNumber": "MJYF4CH/A",
+          "price": 16499,
+          "capacity": "1TB",
+          "colorText": "Black"
+        },
+        {
+          "partNumber": "MJYG4CH/A",
+          "price": 16499,
+          "capacity": "1TB",
+          "colorText": "Silver"
+        },
+        {
+          "partNumber": "MJYH4CH/A",
+          "price": 16499,
+          "capacity": "1TB",
+          "colorText": "Burgundy"
+        },
+        {
+          "partNumber": "MJYJ4CH/A",
+          "price": 16499,
+          "capacity": "1TB",
+          "colorText": "Glacier"
+        },
+        {
+          "partNumber": "MJYK4CH/A",
+          "price": 21499,
+          "capacity": "2TB",
+          "colorText": "Black"
+        },
+        {
+          "partNumber": "MJYL4CH/A",
+          "price": 21499,
+          "capacity": "2TB",
+          "colorText": "Silver"
+        },
+        {
+          "partNumber": "MJYM4CH/A",
+          "price": 21499,
+          "capacity": "2TB",
+          "colorText": "Burgundy"
+        },
+        {
+          "partNumber": "MJYN4CH/A",
+          "price": 21499,
+          "capacity": "2TB",
+          "colorText": "Glacier"
+        }
+      ],
+      "dates": {
+        "preorder": null,
+        "release": null
+      }
+    },
+    "iphone-duo": {
+      "source": "https://www.apple.com.cn/shop/buy-iphone/iphone-duo",
+      "colorMap": {
+        "nightsky": "nightsky",
+        "starwhite": "starwhite"
+      },
+      "variants": [
+        {
+          "partNumber": "MK2M4CH/A",
+          "price": 15999,
+          "capacity": "256GB",
+          "colorText": "Star White"
+        },
+        {
+          "partNumber": "MK2N4CH/A",
+          "price": 15999,
+          "capacity": "256GB",
+          "colorText": "Night Sky"
+        },
+        {
+          "partNumber": "MK2P4CH/A",
+          "price": 17999,
+          "capacity": "512GB",
+          "colorText": "Star White"
+        },
+        {
+          "partNumber": "MK2Q4CH/A",
+          "price": 17999,
+          "capacity": "512GB",
+          "colorText": "Night Sky"
+        },
+        {
+          "partNumber": "MK2T4CH/A",
+          "price": 21499,
+          "capacity": "1TB",
+          "colorText": "Star White"
+        },
+        {
+          "partNumber": "MK2U4CH/A",
+          "price": 21499,
+          "capacity": "1TB",
+          "colorText": "Night Sky"
+        },
+        {
+          "partNumber": "MK2V4CH/A",
+          "price": 26499,
+          "capacity": "2TB",
+          "colorText": "Star White"
+        },
+        {
+          "partNumber": "MK2W4CH/A",
+          "price": 26499,
+          "capacity": "2TB",
+          "colorText": "Night Sky"
+        }
+      ],
+      "dates": {
+        "preorder": "10月16日",
+        "release": "10月23日"
+      }
+    }
+  },
+  "sha256": "78d42656b206e272648c57b573fd388daacbe77d0d94acbae3ec421f17bb1b33"
+}

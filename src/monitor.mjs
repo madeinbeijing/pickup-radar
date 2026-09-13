@@ -1,0 +1,376 @@
+import { logger } from './logger.mjs';
+import { getProduct, launchPhase, productOfSku } from './catalog.mjs';
+
+const log = logger.child({ mod: 'monitor' });
+
+const MINUTE = 60_000;
+
+/**
+ * Adaptive stock monitor.
+ *
+ * Two ideas drive the design:
+ *
+ * 1. A round is planned *globally*, not per city. Every watch is folded into one
+ *    region -> SKU map and handed to the coverage planner, so N watched cities cost
+ *    far fewer than N upstream requests.
+ *
+ * 2. The poll interval is earned, not fixed. Polling every 30s at 04:00 three weeks
+ *    after launch is pure waste; polling every 30s through a launch-morning drop is too
+ *    slow. The cadence tracks launch phase, observed volatility and upstream health —
+ *    the same shape of controller a production uptime monitor uses.
+ */
+export class StockMonitor {
+  constructor({
+    inventory,
+    store,
+    catalog,
+    notifier,
+    intervalMs = 30_000,
+    minIntervalMs = 10_000,
+    maxIntervalMs = 15 * MINUTE,
+    alertCooldownMs = 10 * MINUTE,
+    now = () => Date.now()
+  } = {}) {
+    this.inventory = inventory;
+    this.store = store;
+    this.catalog = catalog;
+    this.notifier = notifier;
+    this.baseIntervalMs = Math.max(minIntervalMs, intervalMs);
+    this.minIntervalMs = minIntervalMs;
+    this.maxIntervalMs = maxIntervalMs;
+    this.alertCooldownMs = alertCooldownMs;
+    this.now = now;
+
+    this.timer = null;
+    this.stopped = true;
+    this.running = false;
+    this.abort = null;
+
+    this.lastRunAt = null;
+    this.lastRunMs = null;
+    this.lastError = null;
+    this.nextRunAt = null;
+    this.currentIntervalMs = this.baseIntervalMs;
+    this.lastTransitionAt = 0;
+    this.counters = { ticks: 0, requests: 0, alerts: 0, suppressed: 0, errors: 0, watchesChecked: 0 };
+  }
+
+  // ---- scheduling ----------------------------------------------------------
+
+  /** Launch phase of one product. Products ship on independent schedules. */
+  phase(productId) {
+    return launchPhase(productId || this.catalog.defaultProduct, this.now());
+  }
+
+  /** Products that at least one watch is tracking. */
+  watchedProducts() {
+    const ids = new Set();
+    for (const watch of this.store.allWatches()) ids.add(watch.product || this.catalog.defaultProduct);
+    return [...ids];
+  }
+
+  /**
+   * Next launch moment worth accelerating for, across watched products only.
+   * Returns ms until that instant, or null when none is near.
+   */
+  nextDropDistance() {
+    let nearest = null;
+    for (const productId of this.watchedProducts()) {
+      const product = getProduct(productId);
+      if (!product) continue;
+      for (const iso of [product.preorderAt, product.releaseAt]) {
+        const distance = Date.parse(iso) - this.now();
+        // A drop is "live" from 15 minutes before until 30 minutes after.
+        if (distance > -30 * MINUTE && distance < 15 * MINUTE) {
+          if (nearest === null || Math.abs(distance) < Math.abs(nearest)) nearest = distance;
+        }
+      }
+    }
+    return nearest;
+  }
+
+  /**
+   * Choose the delay before the next round.
+   * Returns the interval in ms; callers get the reason for observability.
+   */
+  nextDelay() {
+    const now = this.now();
+    const watches = this.store.allWatches().length;
+    if (!watches) return { ms: this.maxIntervalMs, reason: 'idle-no-watches' };
+
+    const breaker = this.inventory.breaker;
+    if (breaker.state === 'open') {
+      // Respect the breaker rather than hammering a known-down upstream.
+      const wait = Math.max(breaker.retryAfterMs(), this.baseIntervalMs);
+      return { ms: Math.min(wait, this.maxIntervalMs), reason: 'circuit-open' };
+    }
+
+    // Hot window: minutes either side of any watched product's drop.
+    if (this.nextDropDistance() !== null) {
+      return { ms: this.minIntervalMs, reason: 'drop-window' };
+    }
+
+    // If every watched product is still pre-launch there is nothing to find. Wake up
+    // rarely, but keep a ceiling so the app is warm before the window opens.
+    const live = this.watchedProducts().filter(id => this.phase(id) !== 'preorder-not-open');
+    if (!live.length) {
+      const soonest = Math.min(...this.watchedProducts()
+        .map(id => Date.parse(getProduct(id)?.preorderAt || '') - now)
+        .filter(Number.isFinite));
+      const ms = Number.isFinite(soonest)
+        ? Math.min(this.maxIntervalMs, Math.max(this.baseIntervalMs * 8, soonest / 4))
+        : this.maxIntervalMs;
+      return { ms, reason: 'pre-launch' };
+    }
+
+    // Recent movement means the shelf is live: stay close to base cadence.
+    const sinceTransition = now - this.lastTransitionAt;
+    if (this.lastTransitionAt && sinceTransition < 10 * MINUTE) {
+      return { ms: this.baseIntervalMs, reason: 'recent-movement' };
+    }
+
+    // Quiet upstream: widen gradually, capped. Halves pressure on Apple overnight.
+    const quietFactor = Math.min(6, 1 + Math.floor(sinceTransition / (20 * MINUTE)));
+    return { ms: Math.min(this.maxIntervalMs, this.baseIntervalMs * quietFactor), reason: 'steady-state' };
+  }
+
+  start() {
+    if (!this.stopped) return;
+    this.stopped = false;
+    this.schedule(1_000, 'startup');
+  }
+
+  schedule(ms, reason) {
+    if (this.stopped) return;
+    if (this.timer) clearTimeout(this.timer);
+    this.currentIntervalMs = ms;
+    this.nextRunAt = new Date(this.now() + ms).toISOString();
+    this.scheduleReason = reason;
+    this.timer = setTimeout(() => {
+      this.tick()
+        .catch(error => log.error('tick failed', { error: error.message }))
+        .finally(() => {
+          const next = this.nextDelay();
+          this.schedule(next.ms, next.reason);
+        });
+    }, ms);
+    this.timer.unref?.();
+  }
+
+  /**
+   * Pull the next round forward.
+   *
+   * The cadence controller can legitimately park the monitor 15 minutes out (say, when
+   * no watches exist). A watch created a second later must not wait out that sleep, so
+   * any event that changes what is being monitored kicks the scheduler.
+   */
+  kick(reason = 'watch-changed', delayMs = 500) {
+    if (this.stopped) return false;
+    const nextAt = Date.parse(this.nextRunAt || '');
+    if (Number.isFinite(nextAt) && nextAt - this.now() <= delayMs) return false;
+    log.debug('scheduler kicked', { reason });
+    this.schedule(delayMs, reason);
+    return true;
+  }
+
+  async stop() {
+    this.stopped = true;
+    if (this.timer) { clearTimeout(this.timer); this.timer = null; }
+    this.abort?.abort();
+    // Let an in-flight round unwind so its state mutations are not lost.
+    for (let i = 0; i < 50 && this.running; i += 1) {
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+  }
+
+  // ---- one round -----------------------------------------------------------
+
+  async tick() {
+    // `stopped` gates *scheduling*, not explicit ticks: startup priming and tests call
+    // tick() directly on a monitor that was never started.
+    if (this.running) return;
+    this.running = true;
+    this.abort = new AbortController();
+    const started = Date.now();
+    this.lastRunAt = new Date(this.now()).toISOString();
+    this.lastError = null;
+    this.counters.ticks += 1;
+
+    try {
+      // Only poll watches whose own product has opened. A pre-launch product has no
+      // inventory to find, and querying it just burns upstream budget.
+      const watches = this.store.allWatches()
+        .filter(watch => this.phase(watch.product || this.catalog.defaultProduct) !== 'preorder-not-open');
+      if (!watches.length) return;
+
+      // Fold every watch into one region -> SKU plan.
+      const regionSkus = new Map();
+      for (const watch of watches) {
+        if (!regionSkus.has(watch.region)) regionSkus.set(watch.region, new Set());
+        regionSkus.get(watch.region).add(watch.sku);
+      }
+      const plan = new Map([...regionSkus].map(([region, skus]) => [region, [...skus]]));
+
+      const before = this.inventory.counters.requests;
+      const results = await this.inventory.queryPlan(plan, { signal: this.abort.signal });
+      this.counters.requests += this.inventory.counters.requests - before;
+
+      let checked = 0;
+      let errored = 0;
+      let firstError = null;
+      for (const watch of watches) {
+        const item = results.get(watch.region)?.[watch.sku];
+        if (!item?.ok) {
+          errored += 1;
+          firstError = firstError || item?.error || 'UNKNOWN';
+          this.counters.errors += 1;
+          this.store.markWatchError(watch.id, item?.error || 'UNKNOWN');
+          continue;
+        }
+        checked += 1;
+        this.counters.watchesChecked += 1;
+        this.evaluate(watch, item);
+      }
+
+      // A round where nothing resolved is invisible otherwise: queryPlan never throws,
+      // it degrades to `unknown`. Surface it so a throttled or broken upstream is not
+      // mistaken for a quiet one.
+      if (errored) {
+        const level = checked === 0 ? 'warn' : 'debug';
+        log[level]('round completed with errors', {
+          checked, errored, total: watches.length, reason: firstError
+        });
+      }
+
+      this.inventory.sweep();
+      this.store.saveCoverage(this.inventory.planner.serialize());
+    } catch (error) {
+      this.lastError = error?.message || 'MONITOR_ERROR';
+      log.error('monitor round failed', { error: this.lastError });
+    } finally {
+      this.lastRunMs = Date.now() - started;
+      this.running = false;
+      this.abort = null;
+    }
+  }
+
+  /**
+   * Compare a fresh reading against the stored baseline and alert on real arrivals.
+   *
+   * Rules, in order of importance:
+   * - A watch with no baseline only records one. First sight is never an "arrival".
+   * - Only a transition *into* `available` alerts. `unknown -> available` counts,
+   *   because the store genuinely became buyable; `available -> available` does not.
+   * - A per-(watch, store) cooldown damps flapping, so a store toggling around the
+   *   boundary cannot spam the user.
+   */
+  evaluate(watch, item) {
+    const nextStates = {};
+    for (const store of item.stores) nextStates[store.id] = store.status;
+
+    const baseline = watch.lastStates;
+    const checkedAt = item.fetchedAt || new Date(this.now()).toISOString();
+
+    if (!baseline) {
+      // Normally first sight is not an arrival — it is just the starting point.
+      //
+      // A watch ARMED BEFORE LAUNCH is the exception. The user set it up while the
+      // product could not be bought at all, so the first reading that shows stock is a
+      // genuine arrival for them. Suppressing it would make "提前布控" pointless: the
+      // one moment they armed it for is exactly the moment it would stay silent.
+      if (watch.armedBeforeLaunch) {
+        const available = item.stores.filter(store => store.status === 'available');
+        for (const store of available) this.raise(watch, store, 'pre-launch', item, checkedAt);
+        this.store.clearArmedFlag(watch.id);
+        log.info('pre-armed watch first reading', {
+          watch: watch.id, region: watch.region, available: available.length
+        });
+      } else {
+        log.debug('baseline established', { watch: watch.id, region: watch.region, stores: item.stores.length });
+      }
+      this.store.updateWatchSnapshot(watch.id, nextStates, checkedAt);
+      return;
+    }
+
+    // A stale reading describes the past; it must not manufacture a transition.
+    if (item.stale) {
+      log.debug('skipping stale reading', { watch: watch.id, ageMs: item.staleAgeMs });
+      return;
+    }
+
+    for (const store of item.stores) {
+      const previous = baseline[store.id] || 'unknown';
+      if (store.status !== 'available' || previous === 'available') continue;
+
+      const since = this.now() - this.store.lastAlertAt(watch.id, store.id);
+      if (since < this.alertCooldownMs) {
+        this.counters.suppressed += 1;
+        log.debug('alert suppressed by cooldown', { watch: watch.id, store: store.id, sinceMs: since });
+        continue;
+      }
+
+      this.raise(watch, store, previous, item, checkedAt);
+    }
+
+    // Baseline advances here for ALL stores, including ones whose alert was suppressed
+    // by cooldown. That is correct *only* because cooldown means "already told them".
+    //
+    // CONTRACT for any future suppression rule: advancing the baseline discards the
+    // transition permanently. Only advance past a store whose transition was actually
+    // communicated. A rule that suppresses an alert the user never received must not
+    // let the baseline move, or that arrival is lost for good.
+    this.store.updateWatchSnapshot(watch.id, nextStates, checkedAt);
+  }
+
+  /** Record and dispatch one arrival. */
+  raise(watch, store, previous, item, checkedAt) {
+    const event = this.store.addEvent({
+      type: 'stock_available',
+      sessionId: watch.sessionId,
+      watchId: watch.id,
+      sku: watch.sku,
+      capacity: watch.capacity,
+      color: watch.color,
+      colorLabel: watch.colorLabel,
+      region: watch.region,
+      regionLabel: watch.regionLabel,
+      storeId: store.id,
+      storeName: store.name,
+      storeQuote: store.quote,
+      previousStatus: previous,
+      product: watch.product || this.catalog.defaultProduct,
+      productName: watch.productName || productOfSku(watch.sku)?.name || 'iPhone',
+      appleUrl: watch.appleUrl,
+      fetchedAt: checkedAt
+    });
+
+    this.store.recordAlert(watch.id, store.id, this.now());
+    this.lastTransitionAt = this.now();
+    this.counters.alerts += 1;
+    log.info('stock available', { region: watch.region, store: store.name, sku: watch.sku, from: previous });
+    this.notifier.send(event);
+    return event;
+  }
+
+  health() {
+    const phases = Object.fromEntries(
+      Object.keys(this.catalog.products).map(id => [id, this.phase(id)])
+    );
+    return {
+      phases,
+      watchedProducts: this.watchedProducts(),
+      intervalMs: this.currentIntervalMs,
+      intervalReason: this.scheduleReason || null,
+      baseIntervalMs: this.baseIntervalMs,
+      running: this.running,
+      stopped: this.stopped,
+      lastRunAt: this.lastRunAt,
+      lastRunMs: this.lastRunMs,
+      nextRunAt: this.nextRunAt,
+      lastError: this.lastError,
+      counters: { ...this.counters }
+    };
+  }
+}
+
+export { EventHub, Notifier } from './notifier.mjs';

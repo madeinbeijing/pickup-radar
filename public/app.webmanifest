@@ -1,0 +1,10 @@
+{
+  "name": "Pickup · Apple Store 库存",
+  "short_name": "Pickup",
+  "description": "Apple Store 到店取货库存查询",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f4f4f6",
+  "theme_color": "#f4f4f6",
+  "icons": [{ "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }]
+}
