@@ -3,7 +3,9 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <meta name="theme-color" content="#f4f4f6" />
+  <meta name="theme-color" content="#f5f5f7" media="(prefers-color-scheme: light)" />
+  <meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)" />
+  <meta name="color-scheme" content="light dark" />
   <meta name="description" content="Apple Store 到店取货库存查询工具。快速查看指定 iPhone 配置在中国大陆 Apple Store 的取货状态。" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="default" />
@@ -17,160 +19,160 @@
   <header class="topbar">
     <div class="nav-shell">
       <a class="brand" href="/" aria-label="Pickup 首页">
-        <span class="brand-symbol" aria-hidden="true"><i></i></span>
-        <span>PICKUP</span>
+        <span class="brand-mark" aria-hidden="true"><i></i></span>
+        <span class="brand-name">Pickup</span>
+        <span class="brand-divider" aria-hidden="true"></span>
+        <span class="brand-sub">Apple Store 到店取货</span>
       </a>
       <div class="top-actions">
+        <a class="icon-btn" href="/stats.html" aria-label="到货统计" title="到货统计">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 20V11M12 20V5M19 20v-6"/></svg>
+        </a>
         <button id="sourceButton" class="source-pill pending" type="button" aria-label="库存数据源状态">
           <span class="signal-dot"></span><span id="sourceText">正在连接</span>
         </button>
         <button id="refreshButton" class="icon-btn" type="button" aria-label="立即刷新库存" title="立即刷新">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6v5h-5M4 18v-5h5M6.2 9A7 7 0 0 1 18.4 7.2L20 11M4 13l1.6 3.8A7 7 0 0 0 17.8 15"/></svg>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20.5 12a8.5 8.5 0 1 1-2.49-6.01"/><path d="M20.5 3.5v5h-5"/></svg>
         </button>
       </div>
     </div>
   </header>
 
-  <main>
-    <section class="intro">
-      <div class="intro-shell">
-        <div class="kicker"><span class="kicker-dot"></span>Apple Store 到店取货</div>
-        <h1>即时查</h1>
+  <main class="layout">
+    <!-- ============ Configuration ============ -->
+    <aside class="config panel" aria-label="配置">
+      <div id="productOptions" class="segmented product-seg" role="radiogroup" aria-label="选择机型"></div>
+
+      <div class="stage">
+        <div id="deviceArt" class="device" aria-hidden="true"></div>
       </div>
-    </section>
 
-    <section class="workspace">
-      <div class="workspace-shell">
-        <aside class="config-card panel">
-          <div class="product-head">
-            <div class="product-copy">
-              <span class="section-label">产品</span>
-              <h2 id="productName">iPhone 18 Pro Max</h2>
-              <p id="productSubtitle" class="product-subtitle">6.9 英寸 · A20 Pro</p>
-              <p id="phaseCopy">预购已开放 · 9 月 18 日发售</p>
-            </div>
-            <div id="deviceArt" class="device-art silver" aria-hidden="true">
-              <span class="lens lens-a"></span><span class="lens lens-b"></span><span class="lens lens-c"></span><span class="flash"></span>
-            </div>
-          </div>
-
-          <div class="control-section">
-            <div class="control-head"><span>机型</span></div>
-            <div id="productOptions" class="product-grid" role="radiogroup" aria-label="选择机型"></div>
-          </div>
-
-          <div class="control-section">
-            <div class="control-head"><span>容量</span><span id="priceLabel" class="meta-value">¥10,999</span></div>
-            <div id="capacityOptions" class="capacity-grid" role="radiogroup" aria-label="选择容量"></div>
-          </div>
-
-          <div class="control-section">
-            <div class="control-head"><span>颜色</span><span id="skuLabel" class="meta-value mono">—</span></div>
-            <div id="colorOptions" class="color-grid" role="radiogroup" aria-label="选择颜色"></div>
-          </div>
-
-          <div class="control-section region-section">
-            <div class="control-head"><span>城市</span><button id="locationButton" class="text-action" type="button">使用我的位置</button></div>
-            <button id="regionButton" class="region-button" type="button" aria-haspopup="dialog">
-              <span class="region-pin"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21s6-5.3 6-11a6 6 0 1 0-12 0c0 5.7 6 11 6 11Z"/><circle cx="12" cy="10" r="2"/></svg></span>
-              <span class="region-copy"><strong id="regionLabel">北京</strong><small id="regionMeta">6 家 Apple Store</small></span>
-              <svg class="chevron" viewBox="0 0 20 20" aria-hidden="true"><path d="m7 5 5 5-5 5"/></svg>
-            </button>
-          </div>
-
-          <div class="selection-card">
-            <div>
-              <span class="selection-label">当前查询</span>
-              <strong id="selectionSummary">256GB · 银色 · 北京</strong>
-            </div>
-            <a id="appleProductLink" href="#" target="_blank" rel="noopener">Apple 官方页 ↗</a>
-          </div>
-
-          <div id="watchCard" class="watch-card">
-            <div class="watch-copy">
-              <span class="watch-label"><i></i>到货监控</span>
-              <strong id="watchTitle">当前配置未监控</strong>
-              <small id="watchMeta"></small>
-            </div>
-            <button id="watchButton" class="watch-button" type="button">开启监控</button>
-          </div>
-        </aside>
-
-        <section class="results-card panel" aria-live="polite">
-          <div class="results-head">
-            <div>
-              <span class="section-label" id="resultsRegionLabel">北京 · 6 家直营店</span>
-              <h2>到店取货</h2>
-            </div>
-            <div class="results-controls">
-              <label class="switch-row" for="autoRefresh">
-                <span>自动刷新</span>
-                <input id="autoRefresh" type="checkbox" checked />
-                <span class="switch"></span>
-              </label>
-              <label class="switch-row" for="soundAlert">
-                <span>到货提示音</span>
-                <input id="soundAlert" type="checkbox" checked />
-                <span class="switch"></span>
-              </label>
-            </div>
-          </div>
-
-          <div id="phaseBanner" class="phase-banner preorder">
-            <div class="phase-icon"><span></span></div>
-            <div class="phase-content"><strong id="phaseTitle">预购已开放</strong></div>
-            <div class="phase-side"><span id="phaseCountdownLabel">距发售</span><strong id="countdown">—</strong></div>
-          </div>
-
-          <div class="metrics">
-            <div><strong id="availableCount">—</strong><span>有货</span></div>
-            <div><strong id="checkedCount">—</strong><span>已确认</span></div>
-            <div><strong id="unknownCount">—</strong><span>未确认</span></div>
-            <div><strong id="updatedTime">—</strong><span>更新时间</span></div>
-          </div>
-
-          <div class="list-toolbar">
-            <div class="filter-tabs" role="tablist" aria-label="库存筛选">
-              <button class="filter-tab active" data-filter="all" type="button">全部</button>
-              <button class="filter-tab" data-filter="available" type="button">只看有货</button>
-            </div>
-            <div id="freshness" class="freshness"><span></span>等待查询</div>
-          </div>
-
-          <div id="storeList" class="store-list">
-            <div class="loading-state">
-              <div class="radar" aria-hidden="true"><span></span><span></span><i></i></div>
-              <strong>正在读取 Apple 库存</strong>
-            </div>
-          </div>
-
-          <div class="results-footer">
-            <button id="demoButton" class="demo-link" type="button">交互预览</button>
-          </div>
-        </section>
+      <div class="product-copy">
+        <h1 id="productName">iPhone 18 Pro Max</h1>
+        <p id="productSubtitle" class="product-subtitle">6.9 英寸 · A20 Pro</p>
+        <p class="phase-line"><span class="phase-dot"></span><span id="phaseCopy">预购已开放</span></p>
       </div>
+
+      <section class="field">
+        <div class="field-head"><h2>容量</h2><span id="priceLabel" class="field-value price">¥10,999</span></div>
+        <div id="capacityOptions" class="capacity-grid" role="radiogroup" aria-label="选择容量"></div>
+      </section>
+
+      <section class="field">
+        <div class="field-head"><h2>颜色</h2><span id="colorName" class="field-value">银色</span></div>
+        <div id="colorOptions" class="swatches" role="radiogroup" aria-label="选择颜色"></div>
+      </section>
+
+      <section class="field">
+        <div class="field-head">
+          <h2>城市</h2>
+          <button id="locationButton" class="link-btn" type="button">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 11 21 3l-8 18-2-8-8-2Z"/></svg><span>使用我的位置</span>
+          </button>
+        </div>
+        <button id="regionButton" class="region-button" type="button" aria-haspopup="dialog">
+          <span class="region-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21s7-6 7-11.5a7 7 0 1 0-14 0C5 15 12 21 12 21Z"/><circle cx="12" cy="9.5" r="2.5"/></svg></span>
+          <span class="region-copy"><strong id="regionLabel">北京</strong><small id="regionMeta">6 家 Apple Store</small></span>
+          <svg class="chevron" viewBox="0 0 20 20" aria-hidden="true"><path d="m8 5 5 5-5 5"/></svg>
+        </button>
+      </section>
+
+      <footer class="config-foot">
+        <span>型号 <b id="skuLabel" class="mono">—</b></span>
+        <a id="appleProductLink" href="#" target="_blank" rel="noopener">在 Apple 官网查看<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5 11 11 5M6 5h5v5"/></svg></a>
+      </footer>
+    </aside>
+
+    <!-- ============ Results ============ -->
+    <section class="results" aria-live="polite">
+      <article id="summaryCard" class="summary panel loading">
+        <div class="summary-top">
+          <div class="summary-copy">
+            <span id="resultsRegionLabel" class="eyebrow">北京 · 6 家 Apple Store</span>
+            <h2 id="summaryTitle"><span class="skeleton-text">正在查询库存</span></h2>
+            <p id="selectionSummary" class="summary-sub">iPhone 18 Pro Max · 256GB · 银色</p>
+          </div>
+          <div id="phaseBanner" class="countdown preorder">
+            <span id="phaseCountdownLabel">距发售</span>
+            <strong id="countdown">—</strong>
+            <small id="phaseTitle">预购已开放</small>
+          </div>
+        </div>
+
+        <div class="distribution">
+          <div id="distBar" class="dist-bar" aria-hidden="true"><i class="seg available"></i><i class="seg unknown"></i><i class="seg unavailable"></i></div>
+          <div class="dist-legend">
+            <span class="legend available"><i></i>可取货 <b id="availableCount">—</b></span>
+            <span class="legend unavailable"><i></i>无货 <b id="unavailableCount">—</b></span>
+            <span class="legend unknown"><i></i>未确认 <b id="unknownCount">—</b></span>
+            <span class="legend-time"><span id="freshness" class="freshness"><span></span>等待查询</span><span class="sep">·</span><span id="updatedTime">—</span></span>
+          </div>
+        </div>
+      </article>
+
+      <article id="watchCard" class="watch panel">
+        <span class="watch-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="M6 16V11a6 6 0 1 1 12 0v5l1.5 2h-15L6 16Z"/><path d="M10 20.5a2.2 2.2 0 0 0 4 0"/></svg>
+        </span>
+        <div class="watch-copy">
+          <strong id="watchTitle">到货监控</strong>
+          <small id="watchMeta"></small>
+        </div>
+        <button id="watchButton" class="btn btn-primary" type="button">开启监控</button>
+      </article>
+
+      <article class="stores panel">
+        <div class="stores-head">
+          <div class="filter-tabs segmented compact" role="tablist" aria-label="库存筛选">
+            <button class="filter-tab active" data-filter="all" type="button" role="tab" aria-selected="true">全部 <span id="allTabCount" class="tab-count"></span></button>
+            <button class="filter-tab" data-filter="available" type="button" role="tab" aria-selected="false">可取货 <span id="availableTabCount" class="tab-count"></span></button>
+          </div>
+          <div class="prefs">
+            <label class="toggle" for="autoRefresh">
+              <input id="autoRefresh" type="checkbox" checked />
+              <span class="toggle-track"></span><span class="toggle-label">自动刷新</span>
+            </label>
+            <label class="toggle" for="soundAlert">
+              <input id="soundAlert" type="checkbox" checked />
+              <span class="toggle-track"></span><span class="toggle-label">提示音</span>
+            </label>
+          </div>
+        </div>
+
+        <div id="storeList" class="store-list"></div>
+
+        <div class="stores-foot">
+          <button id="demoButton" class="link-btn subtle" type="button">交互预览</button>
+        </div>
+      </article>
     </section>
   </main>
 
   <div id="regionModal" class="modal" hidden>
     <div class="modal-backdrop" data-close-modal></div>
-    <section class="modal-sheet" role="dialog" aria-modal="true" aria-labelledby="regionModalTitle">
-      <div class="modal-head">
-        <div><span class="section-label">中国大陆</span><h2 id="regionModalTitle">选择城市</h2></div>
-        <button class="close-btn" type="button" data-close-modal aria-label="关闭">×</button>
+    <section class="sheet" role="dialog" aria-modal="true" aria-labelledby="regionModalTitle">
+      <span class="grabber" aria-hidden="true"></span>
+      <div class="sheet-head">
+        <div>
+          <h2 id="regionModalTitle">选择城市</h2>
+          <p class="sheet-sub"><span id="cityCount">25 个城市</span> · <span id="storeCount">49 家 Apple Store</span></p>
+        </div>
+        <button class="close-btn" type="button" data-close-modal aria-label="关闭">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m6 6 8 8M14 6l-8 8"/></svg>
+        </button>
       </div>
       <label class="search-box">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg>
-        <input id="regionSearch" type="search" autocomplete="off" placeholder="搜索北京、南京、深圳…" />
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="m20 20-4.2-4.2"/></svg>
+        <input id="regionSearch" type="search" autocomplete="off" placeholder="搜索城市" aria-label="搜索城市" />
       </label>
-      <div class="modal-summary"><span id="cityCount">25 个城市</span><span id="storeCount">49 家直营店</span></div>
       <div id="regionList" class="region-list"></div>
     </section>
   </div>
 
   <div id="mobileBar" class="mobile-bar">
-    <div><small id="mobileRegion">北京 · 256GB</small><strong id="mobileSelection">银色</strong></div>
-    <button id="mobileRefresh" type="button">刷新库存</button>
+    <span id="mobileDot" class="mobile-dot"></span>
+    <div class="mobile-copy"><strong id="mobileSelection">正在查询</strong><small id="mobileRegion">北京 · 256GB</small></div>
+    <button id="mobileRefresh" class="btn btn-primary" type="button">刷新</button>
   </div>
 
   <div id="toast" class="toast" role="status"></div>

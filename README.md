@@ -138,7 +138,7 @@ SSE 事件带单调序号，浏览器重连时用 `Last-Event-ID` **重放**断�
 要求 Node.js 20+，推荐 22/24。
 
 ```bash
-npm run check   # 语法检查 + 83 项测试
+npm run check   # 语法检查 + 96 项测试
 npm run dev
 ```
 
@@ -155,6 +155,7 @@ npm run dev
 | `GET /api/events?limit=` | 最近到货事件 |
 | `GET /api/health` | 健康检查；异常时返回 503 |
 | `GET /api/metrics` | Prometheus 指标 |
+| `GET /api/stats` · `GET /api/stats/events` | 到货统计（见"到货统计"一节） |
 | `GET /api/demo?region=` | 交互演示数据，不触达 Apple |
 
 ## 状态语义
@@ -171,6 +172,37 @@ npm run dev
 ## 配置
 
 见 `.env.example`，全部配置项都有注释。
+
+## 到货统计
+
+入口：首页右上角的统计图标，或直接打开 `/stats.html`。点配置或柱子可下钻，筛选条件同步到 URL。
+
+**口径**（Apple 不返回台数，所以"增加了多少"用状态变化来衡量）：
+
+| 指标 | 定义 |
+|---|---|
+| 上架 | 某配置在某门店从无货变为有货 |
+| 售罄 | 从有货变回无货，并得出这次有货持续了多久 |
+| 初次观测 | 第一次看到就已有货，不算上架（没看到它到货） |
+| 同时有货 | 某一时刻有货的「门店 × 配置」数 |
+| 刷新次数 | 监控轮次 + 页面查询；另列缓存命中、发往 Apple 的请求、重试与失败 |
+
+**规则**
+
+- 按「SKU × 门店」计，不按关注计：多人关注同一配置不会重复计数
+- `unknown`（查询失败、门店缺失）不改变状态，绝不记为售罄
+- 只从 `harvest` 喂入：只有新鲜且通过契约校验的数据会被记录，缓存命中和降级数据不会制造状态变化
+- 按北京时间分天。跨日仍有货的门店写一条 `carry`，每天的文件自成一体
+- 服务停机期间发生的变化无法观测：跨停机的售罄标记为 `uncertain`，其时长不计入平均
+
+**存储**：`DATA_DIR/stats/events-YYYY-MM-DD.jsonl`（追加写）、`counters-YYYY-MM-DD.json`、`state.json`，默认保留 30 天（`STATS_RETENTION_DAYS`）。
+
+**接口**
+
+| 端点 | 说明 |
+|---|---|
+| `GET /api/stats?day=&product=` | 总览：刷新计数、到货/售罄、现在有货门店、每小时到货（含按配置）、配置排行 |
+| `GET /api/stats/events?day=&product=&type=&region=&sku=&hour=&limit=&before=` | 记录，最新在前，可按配置与小时筛选，含每小时全量计数 |
 
 ## 目录证据链
 
@@ -194,7 +226,7 @@ npm run verify:catalog:write    # 同上，并另存带 sha256 的快照到 evid
 ## 测试
 
 ```bash
-npm run check        # 83 项单元/契约测试，不触达网络
+npm run check        # 96 项单元/契约测试，不触达网络
 npm run smoke:apple  # 真实 Apple 接口契约测试
 node live-smoke.mjs iphone-duo 512GB nightsky shanghai
 ```

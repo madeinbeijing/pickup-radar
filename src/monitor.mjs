@@ -29,6 +29,7 @@ export class StockMonitor {
     minIntervalMs = 10_000,
     maxIntervalMs = 15 * MINUTE,
     alertCooldownMs = 10 * MINUTE,
+    stats = null,
     now = () => Date.now()
   } = {}) {
     this.inventory = inventory;
@@ -39,6 +40,7 @@ export class StockMonitor {
     this.minIntervalMs = minIntervalMs;
     this.maxIntervalMs = maxIntervalMs;
     this.alertCooldownMs = alertCooldownMs;
+    this.stats = stats;
     this.now = now;
 
     this.timer = null;
@@ -211,6 +213,8 @@ export class StockMonitor {
       }
       const plan = new Map([...regionSkus].map(([region, skus]) => [region, [...skus]]));
 
+      // A round counts only when it actually polls — idle or pre-launch ticks do not.
+      this.stats?.count('monitorRounds');
       const before = this.inventory.counters.requests;
       const results = await this.inventory.queryPlan(plan, { signal: this.abort.signal });
       this.counters.requests += this.inventory.counters.requests - before;

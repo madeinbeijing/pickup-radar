@@ -30,10 +30,10 @@ export const catalog = {
       buyBase: 'https://www.apple.com.cn/shop/buy-iphone/iphone-18-pro/',
       capacities: ['256GB', '512GB', '1TB', '2TB'],
       colors: [
-        { id: 'glacier-blue', label: '冰川蓝色', swatch: '#bed3dd' },
-        { id: 'burgundy', label: '勃艮第酒红色', swatch: '#6f1d2d' },
-        { id: 'silver', label: '银色', swatch: '#d9d9d4' },
-        { id: 'black', label: '黑色', swatch: '#242526' }
+        { id: 'glacier-blue', label: '冰川蓝色', swatch: '#b7c5d8' },
+        { id: 'burgundy', label: '勃艮第酒红色', swatch: '#5e3039' },
+        { id: 'silver', label: '银色', swatch: '#e3e3e1' },
+        { id: 'black', label: '黑色', swatch: '#2c2c2e' }
       ],
       variants: {
         '256GB:glacier-blue': { sku: 'MJY94CH/A', slug: 'mjy94ch/a', price: 10999 },
@@ -64,8 +64,8 @@ export const catalog = {
       buyBase: 'https://www.apple.com.cn/shop/buy-iphone/iphone-duo/',
       capacities: ['256GB', '512GB', '1TB', '2TB'],
       colors: [
-        { id: 'nightsky', label: '夜空色', swatch: '#2b3040' },
-        { id: 'starwhite', label: '星光白色', swatch: '#ece8df' }
+        { id: 'nightsky', label: '夜空色', swatch: '#343c47' },
+        { id: 'starwhite', label: '星光白色', swatch: '#ecebe8' }
       ],
       variants: {
         '256GB:nightsky': { sku: 'MK2N4CH/A', slug: 'mk2n4ch/a', price: 15999 },

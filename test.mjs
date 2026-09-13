@@ -12,6 +12,7 @@ import { StateStore } from './src/state-store.mjs';
 import { StockMonitor } from './src/monitor.mjs';
 import { EventHub, Notifier } from './src/notifier.mjs';
 import { RequestGuard, sameSelection } from './public/request-guard.js';
+import { StatsRecorder, summarize, ledger, buildIntervals, dayKey, dayStart } from './src/stats.mjs';
 
 let passed = 0;
 const failures = [];
@@ -784,6 +785,195 @@ await test('长期无变化时逐步拉长间隔', () => {
   assert.ok(quiet.ms > mon.baseIntervalMs, '静默期应降低轮询频率');
 });
 
+
+// ------------------------------------------------------------ 到货统计 -----
+group('到货统计');
+const T0 = Date.parse('2026-09-18T08:00:00+08:00');
+const at = min => new Date(T0 + min * 60_000).toISOString();
+const store = (id, status) => ({ id, name: id, status });
+async function recorderAt(name, clock) {
+  return new StatsRecorder({ dir: join(dir, name), catalog, now: clock.now, flushDebounceMs: 5 }).init();
+}
+
+await test('按北京时间切日', () => {
+  assert.equal(dayKey(Date.parse('2026-09-17T16:00:00Z')), '2026-09-18', 'UTC 16:00 = 北京次日 00:00');
+  assert.equal(dayKey(Date.parse('2026-09-17T15:59:59Z')), '2026-09-17');
+  assert.equal(dayStart('2026-09-18'), Date.parse('2026-09-18T00:00:00+08:00'));
+});
+await test('首次看到有货只记 baseline，不算上架', async () => {
+  const clock = fakeClock(T0);
+  const rec = await recorderAt('s1', clock);
+  const out = rec.observe({ sku: 'MJY74CH/A', regionId: 'beijing', stores: [store('R320', 'available')], fetchedAt: at(0) });
+  assert.deepEqual(out.map(e => e.type), ['baseline']);
+  await rec.close();
+});
+await test('无货 → 有货 记上架；有货 → 无货 记售罄并算出时长', async () => {
+  const clock = fakeClock(T0);
+  const rec = await recorderAt('s2', clock);
+  const obs = (min, status) => rec.observe({ sku: 'MJY74CH/A', regionId: 'beijing', stores: [store('R320', status)], fetchedAt: at(min) });
+  obs(0, 'unavailable');
+  assert.deepEqual(obs(10, 'available').map(e => e.type), ['up']);
+  assert.deepEqual(obs(11, 'available'), [], '持续有货不重复记');
+  const [down] = obs(22.5, 'unavailable');
+  assert.equal(down.type, 'down');
+  assert.equal(down.durationMs, 12.5 * 60_000);
+  assert.equal(down.capacity, '256GB');
+  assert.equal(down.colorLabel, '银色');
+  assert.equal(down.region, 'beijing');
+  await rec.close();
+});
+await test('unknown 不改变状态，绝不记为售罄', async () => {
+  const clock = fakeClock(T0);
+  const rec = await recorderAt('s3', clock);
+  const obs = (min, status) => rec.observe({ sku: 'MJY74CH/A', regionId: 'beijing', stores: [store('R320', status)], fetchedAt: at(min) });
+  obs(0, 'unavailable'); obs(5, 'available');
+  assert.deepEqual(obs(6, 'unknown'), [], '查询失败不是售罄');
+  assert.deepEqual(obs(7, 'available'), [], 'unknown 之后恢复有货也不是新的上架');
+  await rec.close();
+});
+await test('同一 SKU×门店 被多次读取（多人关注/跨城收割）不重复计数', async () => {
+  const clock = fakeClock(T0);
+  const rec = await recorderAt('s4', clock);
+  rec.observe({ sku: 'MJY74CH/A', regionId: 'beijing', stores: [store('R320', 'unavailable')], fetchedAt: at(0) });
+  const first = rec.observe({ sku: 'MJY74CH/A', regionId: 'beijing', stores: [store('R320', 'available')], fetchedAt: at(1) });
+  const again = rec.observe({ sku: 'MJY74CH/A', regionId: 'beijing', stores: [store('R320', 'available')], fetchedAt: at(1) });
+  assert.equal(first.length + again.length, 1);
+  await rec.close();
+});
+await test('事件与计数落盘，重启后状态可恢复且跨重启的变化标记为不确定', async () => {
+  const clock = fakeClock(T0);
+  const rec = await recorderAt('s5', clock);
+  rec.observe({ sku: 'MJY74CH/A', regionId: 'beijing', stores: [store('R320', 'unavailable')], fetchedAt: at(0) });
+  rec.observe({ sku: 'MJY74CH/A', regionId: 'beijing', stores: [store('R320', 'available')], fetchedAt: at(3) });
+  rec.count('pageQueries', 5); rec.count('cacheHits', 2);
+  await rec.close();
+
+  clock.advance(30 * 60_000);
+  const revived = await recorderAt('s5', clock);
+  assert.equal(revived.counters.pageQueries, 5, '当天计数重启后保留');
+  const [down] = revived.observe({ sku: 'MJY74CH/A', regionId: 'beijing', stores: [store('R320', 'unavailable')], fetchedAt: at(40) });
+  assert.equal(down.type, 'down', '重启前的有货状态必须恢复，否则售罄会丢');
+  assert.equal(down.durationMs, 37 * 60_000);
+  assert.equal(down.uncertain, true, '中间停机过，时长可能不准，必须标注');
+  const events = await revived.readEvents('2026-09-18');
+  assert.deepEqual(events.map(e => e.type), ['up', 'down']);
+  await revived.close();
+});
+await test('跨日时仍有货的门店写入 carry，且不覆盖昨天的计数', async () => {
+  const clock = fakeClock(Date.parse('2026-09-18T23:50:00+08:00'));
+  const rec = await recorderAt('s6', clock);
+  rec.observe({ sku: 'MJYK4CH/A', regionId: 'shanghai', stores: [store('R401', 'unavailable')], fetchedAt: new Date(clock.now()).toISOString() });
+  clock.advance(60_000);
+  rec.observe({ sku: 'MJYK4CH/A', regionId: 'shanghai', stores: [store('R401', 'available')], fetchedAt: new Date(clock.now()).toISOString() });
+  rec.count('monitorRounds', 7);
+  clock.set(Date.parse('2026-09-19T00:05:00+08:00'));
+  rec.count('monitorRounds', 1);
+  await rec.close();
+
+  const today = await rec.readEvents('2026-09-19');
+  assert.equal(today[0]?.type, 'carry', '新的一天应以 carry 开头');
+  const y = JSON.parse(await readFile(join(dir, 's6', 'counters-2026-09-18.json'), 'utf8'));
+  assert.equal(y.counters.monitorRounds, 7, '昨天的计数不得被清零覆盖');
+});
+await test('在新的一天启动的进程不会用空计数覆盖昨天', async () => {
+  const clock = fakeClock(Date.parse('2026-09-18T20:00:00+08:00'));
+  const rec = await recorderAt('s7', clock);
+  rec.count('pageQueries', 42);
+  await rec.close();
+  clock.set(Date.parse('2026-09-19T09:00:00+08:00'));
+  const next = await recorderAt('s7', clock);
+  next.count('pageQueries', 1);
+  await next.close();
+  const y = JSON.parse(await readFile(join(dir, 's7', 'counters-2026-09-18.json'), 'utf8'));
+  assert.equal(y.counters.pageQueries, 42);
+});
+await test('区间重建：carry 从零点起算，未售罄的区间保持开放', () => {
+  const start = dayStart('2026-09-18');
+  const intervals = buildIntervals([
+    { t: new Date(start).toISOString(), type: 'carry', sku: 'A', storeId: 'R1' },
+    { t: at(0), type: 'down', sku: 'A', storeId: 'R1' },
+    { t: at(5), type: 'up', sku: 'A', storeId: 'R2' }
+  ], start);
+  assert.equal(intervals.length, 2);
+  assert.equal(intervals[0].start, start);
+  assert.equal(intervals[0].end, T0);
+  assert.equal(intervals[1].end, null);
+});
+await test('汇总：上架/售罄/峰值/平均时长/排行口径正确', () => {
+  const ev = (min, type, sku, storeId, extra = {}) => ({ t: at(min), type, sku, storeId, region: 'beijing', product: 'iphone-18-pro-max', capacity: sku === 'S1' ? '256GB' : '1TB', colorLabel: '银色', ...extra });
+  const events = [
+    ev(0, 'up', 'S1', 'R1'), ev(0, 'up', 'S1', 'R2'), ev(10, 'down', 'S1', 'R1', { durationMs: 600_000 }),
+    ev(20, 'up', 'S2', 'R1'), ev(50, 'down', 'S2', 'R1', { durationMs: 1_800_000, uncertain: true }),
+    ev(1, 'baseline', 'S2', 'R3')
+  ];
+  const sum = summarize({ day: '2026-09-18', events, counters: {}, firstObservedAt: at(0), product: 'iphone-18-pro-max', catalog, now: T0 + 120 * 60_000 });
+  assert.equal(sum.totals.ups, 3);
+  assert.equal(sum.totals.downs, 2);
+  assert.equal(sum.totals.baselines, 1, 'baseline 单独计，不混入上架');
+  assert.equal(sum.totals.avgDurationMin, 10, '不确定的时长不参与平均');
+  assert.equal(sum.totals.peak.value, 3, '5 分钟时刻 R1/R2 的 S1 + R3 的 baseline');
+  assert.equal(sum.ranking[0].sku, 'S1');
+  assert.equal(sum.ranking[0].stores, 2);
+  assert.equal(sum.window.start, at(0), '图表从首次观测的整点开始');
+});
+await test('明细：筛选、最新在前、同城该配置有货数', () => {
+  const ev = (min, type, storeId, extra = {}) => ({ t: at(min), type, sku: 'S1', storeId, region: 'beijing', product: 'p', capacity: '256GB', ...extra });
+  const events = [ev(0, 'up', 'R1'), ev(2, 'up', 'R2'), ev(9, 'down', 'R1', { durationMs: 540_000 }), { ...ev(3, 'up', 'R9'), region: 'shanghai' }];
+  const all = ledger({ day: '2026-09-18', events });
+  assert.deepEqual(all.rows.map(r => r.t), [at(9), at(3), at(2), at(0)]);
+  const r2 = all.rows.find(r => r.storeId === 'R2');
+  assert.equal(r2.sameCityAvailable, 2, 'R2 上架时北京已有 R1 + 自己');
+  const down = all.rows.find(r => r.type === 'down');
+  assert.equal(down.sameCityAvailable, 1, '售罄那一刻不含自己');
+  assert.equal(all.rows.find(r => r.storeId === 'R1' && r.type === 'up').windowMs, 540_000);
+  assert.equal(ledger({ day: '2026-09-18', events, filters: { region: 'shanghai' } }).total, 1);
+  assert.equal(ledger({ day: '2026-09-18', events, filters: { type: 'down' } }).total, 1);
+});
+await test('汇总只统计当前机型，并按小时给出到货与售罄', () => {
+  const mk = (min, type, sku, product, storeId = 'R1') => ({ t: at(min), type, sku, storeId, region: 'beijing', product, capacity: '256GB', color: 'silver', colorLabel: '银色', durationMs: type === 'down' ? 60_000 : undefined });
+  const events = [
+    mk(0, 'up', 'MJY74CH/A', 'iphone-18-pro-max'), mk(70, 'down', 'MJY74CH/A', 'iphone-18-pro-max'),
+    mk(75, 'up', 'MJY74CH/A', 'iphone-18-pro-max', 'R2'),
+    mk(5, 'up', 'MK2M4CH/A', 'iphone-duo')
+  ];
+  const sum = summarize({ day: '2026-09-18', events, counters: {}, firstObservedAt: at(0), product: 'iphone-18-pro-max', catalog, now: T0 + 180 * 60_000 });
+  assert.equal(sum.totals.ups, 2, 'Duo 的到货不得混入 18 Pro Max 的数字');
+  assert.deepEqual(sum.products.sort(), ['iphone-18-pro-max', 'iphone-duo'], '可切换的机型列表仍包含全部');
+  assert.deepEqual(sum.hourly[8], { hour: 8, up: 1, down: 0 });
+  assert.deepEqual(sum.hourly[9], { hour: 9, up: 1, down: 1 });
+  assert.equal(sum.hourlyUpBySku['MJY74CH/A'][9], 1);
+  assert.equal(sum.hourRange.from, 8);
+  assert.equal(sum.hourRange.to, 10);
+  assert.equal(sum.totals.storesAvailableNow, 1, '只有 R2 仍有货');
+  assert.equal(sum.ranking[0].swatch, catalog.products['iphone-18-pro-max'].colors.find(c => c.id === 'silver').swatch);
+});
+await test('明细可按配置和小时筛选', () => {
+  const mk = (min, sku) => ({ t: at(min), type: 'up', sku, storeId: 'R1', region: 'beijing', product: 'p', capacity: '256GB' });
+  const events = [mk(0, 'A'), mk(10, 'B'), mk(65, 'A')];
+  assert.equal(ledger({ day: '2026-09-18', events, filters: { sku: 'A' } }).total, 2);
+  assert.equal(ledger({ day: '2026-09-18', events, filters: { hour: 8 } }).total, 2);
+  assert.equal(ledger({ day: '2026-09-18', events, filters: { sku: 'A', hour: 9 } }).total, 1);
+  assert.equal(ledger({ day: '2026-09-18', events, filters: { hour: 0 } }).total, 0, '0 点是有效筛选值，不能被当成"未筛选"');
+});
+await test('明细的每小时计数基于全部筛选结果，而不是当前加载的一页', () => {
+  const events = Array.from({ length: 30 }, (_, i) => ({ t: at(i), type: 'up', sku: 'S' + i, storeId: 'R1', region: 'beijing', product: 'p', capacity: '256GB' }));
+  const page = ledger({ day: '2026-09-18', events, limit: 5 });
+  assert.equal(page.rows.length, 5);
+  assert.equal(page.hourCounts[8].up, 30, '08 点应计 30 次上架，而非页面上的 5 条');
+});
+await test('库存服务把新鲜数据喂给统计，缓存命中不喂', async () => {
+  const seen = [];
+  const counts = {};
+  const recorder = { observe: o => seen.push(o), count: (k, n = 1) => { counts[k] = (counts[k] || 0) + n; } };
+  const inv = new InventoryService({ catalog, freshTtlMs: 60_000, recorder, fetchImpl: async () => okResponse(SAMPLE) });
+  await inv.queryOne({ sku: 'MJY74CH/A', regionId: 'beijing' });
+  const afterFirst = seen.length;
+  await inv.queryOne({ sku: 'MJY74CH/A', regionId: 'beijing' });
+  assert.ok(afterFirst >= 1);
+  assert.equal(seen.length, afterFirst, '缓存命中不得再次观测，否则会重复记录');
+  assert.equal(counts.appleRequests, 1);
+});
+
 // ------------------------------------------------- 前端请求竞争 -----------
 group('前端请求竞争');
 const SEL = (region = 'beijing') => ({ product: 'iphone-18-pro-max', capacity: '256GB', color: 'silver', region });
@@ -902,7 +1092,9 @@ await test('推送失败进入重试，耗尽后落入死信', async () => {
   const notifier = new Notifier({
     hub: new EventHub(), ntfyUrl: 'https://ntfy.example/topic', maxAttempts: 3, timeoutMs: 100, retryBaseMs: 5
   });
-  globalThis.fetch = async () => { attempts += 1; return { ok: false, status: 500 }; };
+  // Count only this test's endpoint: notifiers from earlier tests may still be backing off and
+  // would otherwise land on this replaced global fetch, making the count timing-dependent.
+  globalThis.fetch = async url => { if (String(url) === 'https://ntfy.example/topic') attempts += 1; return { ok: false, status: 500 }; };
   notifier.send({ sessionId: 's', productName: 'p', capacity: '256GB', colorLabel: '银色', storeName: '三里屯', appleUrl: 'https://x' });
   await new Promise(r => setTimeout(r, 400));
   assert.equal(attempts, 3, `应重试满 maxAttempts 次，实际 ${attempts} 次`);

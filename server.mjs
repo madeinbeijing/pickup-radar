@@ -3,13 +3,14 @@ import { readFile, stat } from 'node:fs/promises';
 import { extname, join, normalize, resolve as resolvePath, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID, createHash } from 'node:crypto';
-import { catalog, getRegion, getVariant, getProduct, launchPhase } from './src/catalog.mjs';
+import { catalog, getRegion, getVariant, getProduct, launchPhase, productOfSku } from './src/catalog.mjs';
 import { InventoryService } from './src/inventory.mjs';
 import { StateStore } from './src/state-store.mjs';
 import { StockMonitor } from './src/monitor.mjs';
 import { EventHub, Notifier } from './src/notifier.mjs';
 import { CoveragePlanner } from './src/coverage.mjs';
 import { logger } from './src/logger.mjs';
+import { StatsRecorder, summarize, ledger, dayKey } from './src/stats.mjs';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const publicDir = resolvePath(join(__dirname, 'public'));
@@ -27,6 +28,11 @@ const log = logger.child({ mod: 'http' });
 
 const stateStore = await new StateStore(join(dataDir, 'state.json')).init();
 const planner = new CoveragePlanner({ catalog }).restore(stateStore.loadCoverage());
+const stats = await new StatsRecorder({
+  dir: join(dataDir, 'stats'),
+  catalog,
+  retentionDays: Number(process.env.STATS_RETENTION_DAYS || 30)
+}).init();
 
 const inventory = new InventoryService({
   catalog,
@@ -36,7 +42,8 @@ const inventory = new InventoryService({
   timeoutMs: Number(process.env.FETCH_TIMEOUT_MS || 7_000),
   retries: Number(process.env.FETCH_RETRIES || 2),
   maxConcurrency: Number(process.env.UPSTREAM_CONCURRENCY || 3),
-  refillPerSec: Number(process.env.UPSTREAM_RPS || 1.5)
+  refillPerSec: Number(process.env.UPSTREAM_RPS || 1.5),
+  recorder: stats
 });
 
 const hub = new EventHub();
@@ -53,7 +60,8 @@ const monitor = new StockMonitor({
   catalog,
   notifier,
   intervalMs: Number(process.env.MONITOR_INTERVAL_MS || 30_000),
-  alertCooldownMs: Number(process.env.ALERT_COOLDOWN_MS || 10 * 60_000)
+  alertCooldownMs: Number(process.env.ALERT_COOLDOWN_MS || 10 * 60_000),
+  stats
 });
 
 if (process.env.DISABLE_MONITOR !== '1') monitor.start();
@@ -263,6 +271,7 @@ async function handleApi(req, res, url) {
       state: stateStore.statsSnapshot(),
       stream: hub.snapshot(),
       notifications: notifier.snapshot(),
+      stats: stats.snapshot(),
       time: new Date().toISOString()
     });
   }
@@ -289,6 +298,58 @@ async function handleApi(req, res, url) {
     ];
     res.writeHead(200, { 'content-type': 'text/plain; version=0.0.4; charset=utf-8', 'cache-control': 'no-store', ...securityHeaders() });
     return res.end(lines.join('\n') + '\n');
+  }
+
+  if ((url.pathname === '/api/stats' || url.pathname === '/api/stats/events') && req.method === 'GET') {
+    const day = url.searchParams.get('day') || dayKey(Date.now());
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return json(req, res, 400, { ok: false, error: 'INVALID_DAY' });
+    const events = await stats.readEvents(day);
+
+    if (url.pathname === '/api/stats/events') {
+      const type = url.searchParams.get('type');
+      const region = url.searchParams.get('region');
+      const product = url.searchParams.get('product');
+      if (type && type !== 'up' && type !== 'down') return json(req, res, 400, { ok: false, error: 'INVALID_TYPE' });
+      if (region && !getRegion(region)) return json(req, res, 400, { ok: false, error: 'INVALID_REGION' });
+      if (product && !getProduct(product)) return json(req, res, 400, { ok: false, error: 'INVALID_PRODUCT' });
+      const sku = url.searchParams.get('sku');
+      if (sku && !productOfSku(sku)) return json(req, res, 400, { ok: false, error: 'INVALID_SKU' });
+      const hourParam = url.searchParams.get('hour');
+      const hour = hourParam == null || hourParam === '' ? null : Number(hourParam);
+      if (hour != null && !(Number.isInteger(hour) && hour >= 0 && hour <= 23)) return json(req, res, 400, { ok: false, error: 'INVALID_HOUR' });
+      const limit = Math.min(500, Math.max(1, Number(url.searchParams.get('limit')) || 200));
+      const result = ledger({
+        day, events, limit,
+        before: url.searchParams.get('before'),
+        filters: { type, region, product, sku, hour, capacity: url.searchParams.get('capacity') || null }
+      });
+      return json(req, res, 200, { ok: true, day, ...result });
+    }
+
+    // Default the chart to the product with the most activity that day.
+    const requested = url.searchParams.get('product');
+    if (requested && !getProduct(requested)) return json(req, res, 400, { ok: false, error: 'INVALID_PRODUCT' });
+    const tally = {};
+    for (const e of events) if (e.product) tally[e.product] = (tally[e.product] || 0) + 1;
+    const busiest = Object.entries(tally).sort((a, b) => b[1] - a[1])[0]?.[0];
+    const product = requested || busiest || catalog.defaultProduct;
+
+    const { counters, firstObservedAt } = await stats.readCounters(day);
+    const summary = summarize({ day, events, counters, firstObservedAt, product, catalog, now: Date.now() });
+    return json(req, res, 200, {
+      ok: true,
+      ...summary,
+      rankingTotal: summary.ranking.length,
+      days: await stats.availableDays(),
+      regionsSeen: [...new Set(events.filter(e => e.product === product).map(e => e.region).filter(Boolean))],
+      productNames: Object.fromEntries(Object.values(catalog.products).map(p => [p.id, p.name])),
+      configBySku: Object.fromEntries(Object.entries(getProduct(product).variants).map(([key, v]) => {
+        const [capacity, color] = key.split(':');
+        const info = getProduct(product).colors.find(c => c.id === color);
+        return [v.sku, { name: `${capacity} ${info?.label || color}`, swatch: info?.swatch || null }];
+      })),
+      regions: Object.fromEntries(Object.entries(catalog.regions).map(([id, r]) => [id, r.label]))
+    });
   }
 
   if (url.pathname === '/api/demo' && req.method === 'GET') {
@@ -322,8 +383,12 @@ async function handleApi(req, res, url) {
       });
     }
 
+    // A page query is a refresh that needed stock data; gated pre-launch refreshes above
+    // never reach Apple or the cache, so they are not counted.
+    stats.count('pageQueries');
     try {
       const item = await inventory.queryOne({ sku: variant.sku, regionId });
+      if (item.cache === 'HIT') stats.count('cacheHits');
       return json(req, res, 200, {
         ok: true,
         ...item,
@@ -532,7 +597,10 @@ async function shutdown(signal, code = 0) {
   try {
     await monitor.stop();
     stateStore.saveCoverage(planner.serialize());
-    await stateStore.close();
+    // Close both even if one fails, then surface the first failure.
+    const results = await Promise.allSettled([stateStore.close(), stats.close()]);
+    const failed = results.find(result => result.status === 'rejected');
+    if (failed) throw failed.reason;
     logger.info('state flushed, bye');
     process.exit(code);
   } catch (error) {

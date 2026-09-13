@@ -174,6 +174,7 @@ export class InventoryService {
     });
     this.gate = new Semaphore(this.config.maxConcurrency);
     this.planner = options.planner || new CoveragePlanner({ catalog: this.catalog, now: this.now });
+    this.recorder = options.recorder || null;   // optional StatsRecorder
 
     this.upstream = { lastSuccessAt: null, lastLatencyMs: null, lastError: null, lastErrorAt: null, lastContractWarning: null, lastParseError: null };
     this.counters = { requests: 0, retries: 0, failures: 0, contractFailures: 0, contractWarnings: 0, parseErrors: 0, cacheHits: 0, staleServed: 0, harvested: 0, coalesced: 0 };
@@ -236,6 +237,7 @@ export class InventoryService {
       }
       await this.bucket.acquire(signal);
       this.counters.requests += 1;
+      this.recorder?.count('appleRequests');
       log.debug('upstream request', { anchor, skus: skus.length });
 
       try {
@@ -246,7 +248,10 @@ export class InventoryService {
           signal,
           onAttempt: ({ ok, attempt }) => { if (!ok && attempt > 0) this.counters.retries += 1; }
         });
-        if (attempts > 1) this.counters.retries += attempts - 1;
+        if (attempts > 1) {
+          this.counters.retries += attempts - 1;
+          this.recorder?.count('appleRetries', attempts - 1);
+        }
 
         // A 200 with parseable JSON is NOT yet a success. Validate the contract we
         // actually depend on before telling the breaker and the health endpoint that
@@ -274,6 +279,7 @@ export class InventoryService {
         return { data, storeIds: contract.storeIds, latencyMs, fetchedAt: new Date(this.now()).toISOString() };
       } catch (error) {
         this.counters.failures += 1;
+        this.recorder?.count('appleFailures');
         if (error?.contract) {
           this.counters.contractFailures += 1;
           log.error('upstream contract broken', { anchor, error: error.code, detail: error.contract.warning });
@@ -329,6 +335,9 @@ export class InventoryService {
           stores
         };
         this.cache.set(this.cacheKey(sku, regionId), { at: this.now(), value });
+        // Statistics are fed here and only here: harvest sees fresh, contract-valid data,
+        // so a cache hit or a stale fallback can never register as an arrival.
+        this.recorder?.observe({ sku, regionId, stores, fetchedAt });
         written.push(`${sku}|${regionId}`);
       }
     }
