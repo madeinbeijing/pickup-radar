@@ -11,7 +11,7 @@ const MAX_EVENTS = 2_000;
 const MAX_RETRY_MS = 30_000;
 
 function emptyState() {
-  return { schemaVersion: SCHEMA_VERSION, seq: 0, watches: [], events: [], coverage: [], outbox: { queue: [], deadLetter: [] } };
+  return { schemaVersion: SCHEMA_VERSION, seq: 0, watches: [], events: [], coverage: [], outbox: { queue: [], deadLetter: [] }, control: {} };
 }
 
 /**
@@ -77,7 +77,8 @@ export class StateStore {
         coverage: Array.isArray(parsed.coverage) ? parsed.coverage : [],
         outbox: parsed.outbox && typeof parsed.outbox === 'object'
           ? { queue: parsed.outbox.queue || [], deadLetter: parsed.outbox.deadLetter || [] }
-          : { queue: [], deadLetter: [] }
+          : { queue: [], deadLetter: [] },
+        control: parsed.control && typeof parsed.control === 'object' ? parsed.control : {}
       };
       this.migrate(Number(parsed.schemaVersion) || 1);
     } catch (error) {
@@ -376,6 +377,21 @@ export class StateStore {
 
   loadOutbox() {
     return this.state.outbox || { queue: [], deadLetter: [] };
+  }
+
+  /**
+   * Operator switches that must outlive a restart. Pausing the monitor lives here rather
+   * than in memory: under launchd KeepAlive a crash or reboot would otherwise silently
+   * resume polling someone deliberately stopped.
+   */
+  saveControl(patch) {
+    this.state.control = { ...(this.state.control || {}), ...patch };
+    this.touch();
+    return this.state.control;
+  }
+
+  loadControl() {
+    return this.state.control || {};
   }
 
   saveCoverage(rows) {

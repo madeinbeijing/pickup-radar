@@ -23,6 +23,10 @@ const RATE_WINDOW_MS = 60_000;
 const SESSION_MAX_AGE = 365 * 24 * 60 * 60;
 const MAX_WATCHES_PER_SESSION = Number(process.env.MAX_WATCHES_PER_SESSION || 24);
 const PAGE_REFRESH_MAX_AGE_MS = Number(process.env.PAGE_REFRESH_MAX_AGE_MS || 120_000);
+const MONITOR_DISABLED = process.env.DISABLE_MONITOR === '1';
+// The pause switch is global — one visitor stops alerts for everyone. Fine for a personal
+// instance; a shared deployment sets MONITOR_CONTROL=0 to take it off the page.
+const MONITOR_CONTROL = process.env.MONITOR_CONTROL !== '0';
 
 const log = logger.child({ mod: 'http' });
 
@@ -66,9 +70,12 @@ const monitor = new StockMonitor({
   stats
 });
 
-if (process.env.DISABLE_MONITOR !== '1') {
+if (!MONITOR_DISABLED) {
   // Page refreshes and cross-city harvests reach watches as soon as they land.
   inventory.onFresh(readings => monitor.observe(readings));
+  // A pause survives restarts: launchd KeepAlive must not quietly undo it.
+  const control = stateStore.loadControl();
+  if (control.monitorPaused) monitor.pause(Date.parse(control.monitorPausedAt) || Date.now());
   monitor.start();
 }
 
@@ -207,6 +214,17 @@ function demoStores(regionInfo) {
   }));
 }
 
+function monitorControl() {
+  return {
+    ok: true,
+    enabled: !MONITOR_DISABLED,
+    controllable: MONITOR_CONTROL && !MONITOR_DISABLED,
+    paused: monitor.paused,
+    pausedAt: monitor.pausedAt,
+    activeWatches: stateStore.statsSnapshot().activeWatches
+  };
+}
+
 /** Establish a baseline immediately so a new watch cannot fire a false first alert. */
 async function primeWatch(watch) {
   if (phaseOf(watch.product) === 'preorder-not-open') return;
@@ -291,6 +309,29 @@ async function handleApi(req, res, url) {
     });
   }
 
+  if (url.pathname === '/api/monitor' && req.method === 'GET') {
+    return json(req, res, 200, monitorControl());
+  }
+
+  if (url.pathname === '/api/monitor' && req.method === 'POST') {
+    if (MONITOR_DISABLED) return json(req, res, 409, { ok: false, error: 'MONITOR_DISABLED' });
+    if (!MONITOR_CONTROL) return json(req, res, 403, { ok: false, error: 'MONITOR_CONTROL_DISABLED' });
+    let body;
+    try { body = await readJson(req); }
+    catch (error) { return json(req, res, error.message === 'BODY_TOO_LARGE' ? 413 : 400, { ok: false, error: error.message }); }
+    if (typeof body.paused !== 'boolean') return json(req, res, 400, { ok: false, error: 'INVALID_PAUSED' });
+
+    const changed = body.paused ? monitor.pause() : monitor.resume();
+    if (changed) {
+      stateStore.saveControl({ monitorPaused: monitor.paused, monitorPausedAt: monitor.pausedAt });
+      // Persist now, not on the debounce: a crash right after "stop" must not resume polling.
+      await stateStore.flushNow();
+      log.info(monitor.paused ? 'monitor paused via api' : 'monitor resumed via api', { ip: clientIp(req) });
+      hub.broadcast(monitorControl(), 'monitor');
+    }
+    return json(req, res, 200, monitorControl());
+  }
+
   if (url.pathname === '/api/metrics' && req.method === 'GET') {
     const inv = inventory.health();
     const mon = monitor.health();
@@ -309,6 +350,7 @@ async function handleApi(req, res, url) {
       `pickup_monitor_suppressed_total ${mon.counters.suppressed}`,
       `pickup_monitor_interval_ms ${mon.intervalMs}`,
       `pickup_monitor_stalled ${mon.stalled ? 1 : 0}`,
+      `pickup_monitor_paused ${mon.paused ? 1 : 0}`,
       `pickup_monitor_failed_rounds ${mon.failedRounds}`,
       `pickup_state_persist_failing ${stateStore.stats.failing ? 1 : 0}`,
       `pickup_stats_write_failing ${stats.snapshot().writeFailing ? 1 : 0}`,
@@ -588,7 +630,7 @@ server.listen(port, '0.0.0.0', () => {
     products: Object.keys(catalog.products).length,
     phases: allPhases(),
     watches: stateStore.statsSnapshot().activeWatches,
-    monitor: process.env.DISABLE_MONITOR === '1' ? 'disabled' : 'enabled'
+    monitor: MONITOR_DISABLED ? 'disabled' : monitor.paused ? 'paused' : 'enabled'
   });
 });
 

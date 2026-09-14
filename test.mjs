@@ -1056,6 +1056,74 @@ await test('有关注时静默期间隔不超过 quietMaxIntervalMs', () => {
 });
 
 
+await test('暂停监控：不调度、不被 kick 唤醒，恢复后立即重新调度', () => {
+  const { mon } = schedulerFixture();
+  mon.start();
+  assert.ok(mon.timer, '启动后应有定时器');
+  assert.equal(mon.pause(), true);
+  assert.equal(mon.pause(), false, '重复暂停是空操作');
+  assert.equal(mon.timer, null, '暂停必须清掉定时器');
+  assert.equal(mon.nextRunAt, null);
+  assert.equal(mon.kick('watch-created'), false, '新增关注不能唤醒已暂停的监控');
+  mon.start();
+  assert.equal(mon.timer, null, '暂停期间 start() 不应恢复调度（重启时恢复暂停状态靠这一点）');
+  assert.equal(mon.stalled(), false, '暂停不是停摆');
+  assert.equal(mon.health().paused, true);
+
+  mon.failedRounds = 3;
+  mon.lastRound = { checked: 0, errored: 2 };
+  assert.equal(mon.resume(), true);
+  assert.ok(mon.timer, '恢复后应重新调度');
+  assert.equal(mon.failedRounds, 0, '暂停前的轮次结果不应带到恢复之后');
+  assert.equal(mon.lastRound, null);
+  mon.stop();
+});
+await test('暂停期间网页查询带来的新鲜读数不会触发到货', async () => {
+  const clock = fakeClock();
+  const store = await new StateStore(join(dir, 'pause-observe.json'), { flushDebounceMs: 5, now: clock.now }).init();
+  const mon = new StockMonitor({ inventory: {}, store, catalog, notifier: new Notifier({ hub: new EventHub() }), alertCooldownMs: 0, now: clock.now });
+  const watch = store.createWatch('s', { sku: 'MJY74CH/A', region: 'beijing', capacity: '256GB', color: 'silver' });
+  store.updateWatchSnapshot(watch.id, { R320: 'unavailable' }, new Date(clock.now()).toISOString());
+  clock.advance(1_000);
+  const reading = { sku: 'MJY74CH/A', region: 'beijing', fetchedAt: new Date(clock.now()).toISOString(), stores: [{ id: 'R320', name: '三里屯', status: 'available' }] };
+
+  mon.pause();
+  mon.observe([reading]);
+  assert.equal(store.listEvents('s').length, 0, '暂停期间不得报警');
+  assert.equal(store.allWatches()[0].lastStates.R320, 'unavailable', '暂停期间基线不应前移，否则恢复后会漏报');
+
+  mon.resume(); mon.stop();
+  mon.observe([reading]);
+  assert.equal(store.listEvents('s').length, 1, '恢复后同样的变化应当报警');
+  await store.close();
+});
+await test('暂停期间在途的一轮读数被丢弃，不报警也不记错误', async () => {
+  const clock = fakeClock();
+  const store = await new StateStore(join(dir, 'pause-inflight.json'), { flushDebounceMs: 5, now: clock.now }).init();
+  const inv = monitorFixture({ clock, responses: [NONE, SAMPLE] });
+  const mon = new StockMonitor({ inventory: inv, store, catalog, notifier: new Notifier({ hub: new EventHub() }), alertCooldownMs: 0, now: clock.now });
+  store.createWatch('s', { sku: 'MJY74CH/A', region: 'beijing', capacity: '256GB', color: 'silver' });
+  await mon.tick();                        // 基线
+  clock.advance(60_000);
+  const round = mon.tick();
+  mon.pause();                             // 请求发出后才暂停
+  await round;
+  assert.equal(store.listEvents('s').length, 0);
+  assert.equal(store.allWatches()[0].consecutiveErrors, 0);
+  await store.close();
+});
+await test('暂停开关持久化，重启后仍为暂停', async () => {
+  const file = join(dir, 'control.json');
+  const first = await new StateStore(file, { flushDebounceMs: 5 }).init();
+  assert.deepEqual(first.loadControl(), {});
+  first.saveControl({ monitorPaused: true, monitorPausedAt: '2026-09-15T02:00:00.000Z' });
+  await first.close();
+  const second = await new StateStore(file).init();
+  assert.equal(second.loadControl().monitorPaused, true);
+  assert.equal(second.loadControl().monitorPausedAt, '2026-09-15T02:00:00.000Z');
+  await second.close();
+});
+
 // ------------------------------------------------------------ 到货统计 -----
 group('到货统计');
 const T0 = Date.parse('2026-09-18T08:00:00+08:00');
@@ -1523,6 +1591,27 @@ await test('持久化失败、统计写入失败、近期死信：降级但仍�
   input.stats.writeFailing = false;
   input.notifications.lastDeadLetterAt = new Date(input.now - 2 * 3600_000).toISOString();
   assert.equal(assessHealth(input).status, 'ok', '很久以前的死信不应永久挂黄');
+});
+
+await test('主动暂停：降级但仍为 200，且屏蔽暂停前遗留的轮次故障', () => {
+  const input = healthy();
+  input.monitor.paused = true;
+  input.monitor.failedRounds = 5;
+  input.monitor.lastRound = { checked: 0, errored: 3 };
+  input.monitor.lastError = 'boom';
+  const verdict = assessHealth(input);
+  assert.equal(verdict.status, 'degraded');
+  assert.equal(verdict.httpStatus, 200, '暂停是有意为之，不能让守护进程重启它');
+  assert.deepEqual(verdict.problems, []);
+  assert.deepEqual(verdict.warnings, ['monitor-paused']);
+});
+await test('EventHub.broadcast 发给所有会话', () => {
+  const hub = new EventHub();
+  const got = [];
+  hub.add('a', { write: chunk => got.push(['a', chunk]) });
+  hub.add('b', { write: chunk => got.push(['b', chunk]) });
+  assert.equal(hub.broadcast({ paused: true }, 'monitor'), 2);
+  assert.ok(got.every(([, chunk]) => chunk.startsWith('event: monitor\n')));
 });
 
 await rm(dir, { recursive: true, force: true });

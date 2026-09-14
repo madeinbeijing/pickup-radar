@@ -15,6 +15,9 @@ const state = {
   status: 'loading',
   renderedSelection: null,
   watches: [],
+  // Server-wide monitor switch; shared by every viewer, unlike the toggles below.
+  monitor: { controllable: false, paused: false, pausedAt: null, activeWatches: 0 },
+  monitorLoading: false,
   loading: false,
   watchLoading: false,
   demo: query.get('demo') === '1',
@@ -45,6 +48,7 @@ const els = {
   storeList: $('#storeList'), autoRefresh: $('#autoRefresh'), soundAlert: $('#soundAlert'), demoButton: $('#demoButton'),
   regionModal: $('#regionModal'), regionSearch: $('#regionSearch'), regionList: $('#regionList'), cityCount: $('#cityCount'), storeCount: $('#storeCount'),
   mobileDot: $('#mobileDot'), mobileRegion: $('#mobileRegion'), mobileSelection: $('#mobileSelection'), mobileRefresh: $('#mobileRefresh'),
+  monitorButton: $('#monitorButton'), pauseBanner: $('#pauseBanner'), pauseMeta: $('#pauseMeta'), resumeButton: $('#resumeButton'),
   toast: $('#toast')
 };
 
@@ -232,13 +236,22 @@ function renderWatch() {
   // A pre-launch product can still be armed: the monitor skips it until its window
   // opens, so arming early costs nothing and is exactly what a user wants beforehand.
   const blocked = state.demo;
-  els.watchCard.classList.toggle('active', Boolean(watch));
+  const paused = state.monitor.paused;
+  els.watchCard.classList.toggle('active', Boolean(watch) && !paused);
+  els.watchCard.classList.toggle('paused', Boolean(watch) && paused);
   els.watchCard.classList.toggle('disabled', blocked && !watch);
   els.watchButton.disabled = state.watchLoading || (blocked && !watch);
   els.watchButton.className = `btn ${watch ? 'btn-secondary' : 'btn-primary'}`;
 
   if (state.watchLoading) {
     els.watchButton.textContent = '处理中…';
+    return;
+  }
+
+  if (watch && paused) {
+    els.watchTitle.textContent = '监控已暂停';
+    els.watchMeta.textContent = '关注已保留，恢复监控后继续检查';
+    els.watchButton.textContent = '移除';
     return;
   }
 
@@ -266,7 +279,7 @@ function renderWatch() {
   }
 
   els.watchTitle.textContent = '到货监控';
-  els.watchMeta.textContent = '';
+  els.watchMeta.textContent = paused ? '全部监控已停止，恢复后生效' : '';
   els.watchButton.textContent = '开启监控';
 }
 
@@ -531,6 +544,70 @@ async function refresh({ forceDemo = false, silent = false, auto = false } = {})
   }
 }
 
+// ---- global monitor switch ---------------------------------------------------
+
+function renderMonitor() {
+  const { controllable, paused, pausedAt, activeWatches } = state.monitor;
+  els.monitorButton.hidden = !controllable;
+  els.monitorButton.disabled = state.monitorLoading;
+  els.monitorButton.classList.toggle('paused', paused);
+  const label = paused ? '恢复监控' : '停止全部监控';
+  els.monitorButton.title = label;
+  els.monitorButton.setAttribute('aria-label', label);
+
+  els.pauseBanner.hidden = !paused;
+  els.resumeButton.hidden = !controllable;
+  els.resumeButton.disabled = state.monitorLoading;
+  els.resumeButton.textContent = state.monitorLoading ? '处理中…' : '恢复监控';
+  if (paused) {
+    const since = pausedAt ? `${dateLabel(pausedAt)} ${new Date(pausedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })} 起` : '';
+    const kept = activeWatches ? `${activeWatches} 个关注已保留` : '';
+    els.pauseMeta.textContent = ['不再查询 Apple，也不会发送到货提醒', since, kept].filter(Boolean).join(' · ');
+  }
+  renderWatch();
+}
+
+function applyMonitor(data) {
+  if (!data || typeof data.paused !== 'boolean') return;
+  state.monitor = {
+    controllable: Boolean(data.controllable),
+    paused: data.paused,
+    pausedAt: data.pausedAt || null,
+    activeWatches: Number(data.activeWatches) || 0
+  };
+  renderMonitor();
+}
+
+async function loadMonitor() {
+  try {
+    const response = await fetch('/api/monitor', { cache: 'no-store' });
+    if (response.ok) applyMonitor(await response.json());
+  } catch {}
+}
+
+async function setMonitorPaused(paused) {
+  if (state.monitorLoading || state.demo) return;
+  if (paused && !confirm('停止全部监控？\n\n后台将不再查询 Apple，也不会发送任何到货提醒（包括手机推送），对所有关注生效。\n关注会保留，随时可以恢复。')) return;
+  state.monitorLoading = true;
+  renderMonitor();
+  try {
+    const response = await fetch('/api/monitor', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ paused })
+    });
+    const result = await response.json();
+    if (!response.ok || !result.ok) throw new Error(result.error || 'MONITOR_CONTROL_FAILED');
+    applyMonitor(result);
+    toast(paused ? '已停止全部监控' : '已恢复监控');
+  } catch {
+    toast(paused ? '停止监控失败，请稍后重试' : '恢复监控失败，请稍后重试');
+  } finally {
+    state.monitorLoading = false;
+    renderMonitor();
+  }
+}
+
 async function loadWatches() {
   try {
     const response = await fetch('/api/watches', { cache: 'no-store' });
@@ -573,7 +650,7 @@ async function toggleWatch() {
       const permission = permissionPromise ? await permissionPromise : ('Notification' in window ? Notification.permission : 'unsupported');
       toast('已开启监控');
     }
-    await loadWatches();
+    await Promise.all([loadWatches(), loadMonitor()]);
   } catch {
     toast(existing ? '停止监控失败，请稍后重试' : '开启监控失败，请稍后重试');
   } finally {
@@ -651,6 +728,10 @@ function connectEventStream() {
   state.eventSource?.close();
   const stream = new EventSource('/api/stream');
   state.eventSource = stream;
+  // Another tab or device flipped the switch.
+  stream.addEventListener('monitor', message => {
+    try { applyMonitor(JSON.parse(message.data)); } catch {}
+  });
   stream.addEventListener('stock', async message => {
     try {
       const event = JSON.parse(message.data);
@@ -750,6 +831,8 @@ function setupEvents() {
   els.mobileRefresh.addEventListener('click', () => refresh());
   document.querySelector('.mobile-copy').addEventListener('click', () => els.summaryCard.scrollIntoView({ behavior: 'smooth', block: 'start' }));
   els.watchButton.addEventListener('click', toggleWatch);
+  els.monitorButton.addEventListener('click', () => setMonitorPaused(!state.monitor.paused));
+  els.resumeButton.addEventListener('click', () => setMonitorPaused(false));
   els.regionButton.addEventListener('click', openRegionModal);
   els.locationButton.addEventListener('click', useLocation);
   els.regionSearch.addEventListener('input', event => renderRegionList(event.target.value));
@@ -806,6 +889,7 @@ function setupEvents() {
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible') {
       loadWatches();
+      loadMonitor();
       if (state.autoRefresh) refresh({ silent: true, auto: true });
     }
   });
@@ -838,7 +922,7 @@ async function init() {
     // Registration must not gate the first query — the answer matters more than the shell cache.
     if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
     if (query.get('snapshot') !== '1') connectEventStream();
-    await Promise.all([loadWatches(), refresh()]);
+    await Promise.all([loadWatches(), loadMonitor(), refresh()]);
   } catch (error) {
     sourceState('error', '服务未连接');
     els.summaryCard.className = 'summary panel error';

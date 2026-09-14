@@ -44,6 +44,13 @@ export class EventHub {
     return sent;
   }
 
+  /** Send one frame to every connected session — for state shared by all viewers. */
+  broadcast(event, type) {
+    let sent = 0;
+    for (const sessionId of this.clients.keys()) sent += this.emit(sessionId, event, type);
+    return sent;
+  }
+
   replay(res, events) {
     for (const event of events) {
       try { res.write(this.frame(event)); } catch { return; }

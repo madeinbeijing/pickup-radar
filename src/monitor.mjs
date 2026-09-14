@@ -54,6 +54,10 @@ export class StockMonitor {
 
     this.timer = null;
     this.stopped = true;
+    // Operator pause: no rounds and no alerts until resumed. Distinct from `stopped`, which
+    // is also true before start() and during shutdown and says nothing about intent.
+    this.paused = false;
+    this.pausedAt = null;
     this.running = false;
     this.abort = null;
 
@@ -186,7 +190,7 @@ export class StockMonitor {
   }
 
   start() {
-    if (!this.stopped) return;
+    if (!this.stopped || this.paused) return;
     this.stopped = false;
     this.schedule(1_000, 'startup');
   }
@@ -235,6 +239,43 @@ export class StockMonitor {
     }
   }
 
+  /**
+   * Stop monitoring entirely until resume(): no rounds reach Apple and nothing alerts.
+   *
+   * Watches and their baselines are kept. A round already in flight is left to finish
+   * rather than aborted — an aborted round degrades every watch to an error and would
+   * leave a failing health verdict behind — but its readings are discarded unevaluated.
+   */
+  pause(at = this.now()) {
+    if (this.paused) return false;
+    this.paused = true;
+    this.pausedAt = new Date(at).toISOString();
+    this.stopped = true;
+    if (this.timer) { clearTimeout(this.timer); this.timer = null; }
+    this.nextRunAt = null;
+    this.scheduleReason = 'paused';
+    log.info('monitor paused');
+    return true;
+  }
+
+  /**
+   * Resume after pause(). Baselines survived the pause, so a store that became available
+   * meanwhile still alerts on the first round — the safe direction for a stock monitor.
+   */
+  resume() {
+    if (!this.paused) return false;
+    this.paused = false;
+    this.pausedAt = null;
+    // Round outcomes from before the pause describe a different moment; carrying them
+    // over would keep health red until the first round after resuming.
+    this.lastRound = null;
+    this.lastError = null;
+    this.failedRounds = 0;
+    this.start();
+    log.info('monitor resumed');
+    return true;
+  }
+
   // ---- one round -----------------------------------------------------------
 
   async tick() {
@@ -268,6 +309,8 @@ export class StockMonitor {
       const before = this.inventory.counters.requests;
       const results = await this.inventory.queryPlan(plan, { signal: this.abort.signal });
       this.counters.requests += this.inventory.counters.requests - before;
+      // Paused while the request was out: the readings stay unevaluated, so nothing alerts.
+      if (this.paused) return;
 
       let checked = 0;
       let errored = 0;
@@ -322,6 +365,7 @@ export class StockMonitor {
    * upstream request. Rounds remain the guaranteed floor; this only makes detection earlier.
    */
   observe(readings) {
+    if (this.paused) return;
     const byKey = new Map(readings.map(item => [`${item.sku}|${item.region}`, item]));
     for (const watch of this.store.allWatches()) {
       const item = byKey.get(`${watch.sku}|${watch.region}`);
@@ -471,6 +515,8 @@ export class StockMonitor {
       paceFactor: Math.round(this.pace.factor * 100) / 100,
       running: this.running,
       stopped: this.stopped,
+      paused: this.paused,
+      pausedAt: this.pausedAt,
       lastRunAt: this.lastRunAt,
       lastRunMs: this.lastRunMs,
       nextRunAt: this.nextRunAt,

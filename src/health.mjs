@@ -23,13 +23,18 @@ export function assessHealth({ inventory, monitor, state, stats, notifications, 
   const warnings = [];
 
   if (inventory.circuit.state !== 'closed') problems.push(`circuit-${inventory.circuit.state}`);
-  if (monitor.stalled) problems.push('monitor-stalled');
-  if (monitor.lastError) problems.push('monitor-error');
-  if (monitor.failedRounds >= FAILED_ROUNDS_DOWN) problems.push('rounds-failing');
+  // A deliberate pause is not an outage: 503 would tell a supervisor to restart a process
+  // that is doing exactly what it was told. Round signals are frozen history while paused.
+  if (monitor.paused) warnings.push('monitor-paused');
+  else {
+    if (monitor.stalled) problems.push('monitor-stalled');
+    if (monitor.lastError) problems.push('monitor-error');
+    if (monitor.failedRounds >= FAILED_ROUNDS_DOWN) problems.push('rounds-failing');
+  }
 
   if (state?.failing) warnings.push('state-persist-failing');
   if (stats?.writeFailing) warnings.push('stats-write-failing');
-  if (monitor.lastRound?.errored && monitor.failedRounds < FAILED_ROUNDS_DOWN) warnings.push('round-partially-failed');
+  if (!monitor.paused && monitor.lastRound?.errored && monitor.failedRounds < FAILED_ROUNDS_DOWN) warnings.push('round-partially-failed');
   if (inventory.upstream?.lastContractWarning) warnings.push('contract-partial');
   const deadAt = Date.parse(notifications?.lastDeadLetterAt || '');
   if (Number.isFinite(deadAt) && now - deadAt < DEAD_LETTER_WINDOW_MS) warnings.push('notification-dead-lettered');

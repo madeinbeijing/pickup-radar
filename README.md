@@ -159,6 +159,7 @@ npm run dev
 | `GET /api/stream` | SSE 事件流（支持 `Last-Event-ID` 重放） |
 | `GET /api/events?limit=` | 最近到货事件 |
 | `GET /api/health` | 健康检查：`status` 为 `ok` / `degraded` / `down`，并列出 `problems` 与 `warnings`；只有无法发现到货（`down`）时返回 503 |
+| `GET /api/monitor` · `POST /api/monitor` `{"paused": true\|false}` | 全局停止 / 恢复监控。停止后不再查询 Apple、不发任何到货提醒，关注与基线保留，重启后仍保持停止；健康检查报 `monitor-paused`（降级，200）。`MONITOR_CONTROL=0` 可关闭此开关 |
 | `GET /api/metrics` | Prometheus 指标 |
 | `GET /api/stats` · `GET /api/stats/events` | 到货统计（见"到货统计"一节） |
 | `GET /api/demo?region=` | 交互演示数据，不触达 Apple |

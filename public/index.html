@@ -28,6 +28,10 @@
         <a class="icon-btn" href="/stats.html" aria-label="到货统计" title="到货统计">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 20V11M12 20V5M19 20v-6"/></svg>
         </a>
+        <button id="monitorButton" class="icon-btn monitor-btn" type="button" aria-label="停止全部监控" title="停止全部监控" hidden>
+          <svg class="icon-stop" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6.5v11M15 6.5v11"/></svg>
+          <svg class="icon-play" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5.5v13l10.5-6.5L8 5.5Z"/></svg>
+        </button>
         <button id="sourceButton" class="source-pill pending" type="button" aria-label="库存数据源状态">
           <span class="signal-dot"></span><span id="sourceText">正在连接</span>
         </button>
@@ -85,6 +89,17 @@
 
     <!-- ============ Results ============ -->
     <section class="results" aria-live="polite">
+      <article id="pauseBanner" class="pause-banner panel" hidden>
+        <span class="pause-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="M9 6.5v11M15 6.5v11"/></svg>
+        </span>
+        <div class="pause-copy">
+          <strong>监控已全部停止</strong>
+          <small id="pauseMeta">不再查询 Apple，也不会发送到货提醒</small>
+        </div>
+        <button id="resumeButton" class="btn btn-primary" type="button">恢复监控</button>
+      </article>
+
       <article id="summaryCard" class="summary panel loading">
         <div class="summary-top">
           <div class="summary-copy">
