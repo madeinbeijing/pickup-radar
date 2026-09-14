@@ -10,6 +10,7 @@ import { StockMonitor } from './src/monitor.mjs';
 import { EventHub, Notifier, notifierOptionsFromEnv } from './src/notifier.mjs';
 import { CoveragePlanner } from './src/coverage.mjs';
 import { logger } from './src/logger.mjs';
+import { assessHealth } from './src/health.mjs';
 import { StatsRecorder, summarize, ledger, dayKey } from './src/stats.mjs';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
@@ -21,6 +22,7 @@ const RATE_LIMIT = Number(process.env.RATE_LIMIT || 180);
 const RATE_WINDOW_MS = 60_000;
 const SESSION_MAX_AGE = 365 * 24 * 60 * 60;
 const MAX_WATCHES_PER_SESSION = Number(process.env.MAX_WATCHES_PER_SESSION || 24);
+const PAGE_REFRESH_MAX_AGE_MS = Number(process.env.PAGE_REFRESH_MAX_AGE_MS || 120_000);
 
 const log = logger.child({ mod: 'http' });
 
@@ -263,19 +265,28 @@ async function handleApi(req, res, url) {
 
   if (url.pathname === '/api/health' && req.method === 'GET') {
     const inv = inventory.health();
-    const degraded = inv.circuit.state !== 'closed' || Boolean(monitor.health().lastError);
-    return json(req, res, degraded ? 503 : 200, {
-      ok: !degraded,
+    const mon = monitor.health();
+    const state = stateStore.statsSnapshot();
+    const statsHealth = stats.snapshot();
+    const notifications = notifier.snapshot();
+    const verdict = assessHealth({
+      inventory: inv, monitor: mon, state: state.persistence, stats: statsHealth, notifications
+    });
+    return json(req, res, verdict.httpStatus, {
+      ok: verdict.status !== 'down',
+      status: verdict.status,
+      problems: verdict.problems,
+      warnings: verdict.warnings,
       service: 'pickup-radar',
       version: catalog.meta.version,
       phases: allPhases(),
       uptimeSec: Math.round(process.uptime()),
       inventory: inv,
-      monitor: monitor.health(),
-      state: stateStore.statsSnapshot(),
+      monitor: mon,
+      state,
       stream: hub.snapshot(),
-      notifications: notifier.snapshot(),
-      stats: stats.snapshot(),
+      notifications,
+      stats: statsHealth,
       time: new Date().toISOString()
     });
   }
@@ -297,6 +308,10 @@ async function handleApi(req, res, url) {
       `pickup_monitor_alerts_total ${mon.counters.alerts}`,
       `pickup_monitor_suppressed_total ${mon.counters.suppressed}`,
       `pickup_monitor_interval_ms ${mon.intervalMs}`,
+      `pickup_monitor_stalled ${mon.stalled ? 1 : 0}`,
+      `pickup_monitor_failed_rounds ${mon.failedRounds}`,
+      `pickup_state_persist_failing ${stateStore.stats.failing ? 1 : 0}`,
+      `pickup_stats_write_failing ${stats.snapshot().writeFailing ? 1 : 0}`,
       `pickup_watches_active ${stateStore.statsSnapshot().activeWatches}`,
       `pickup_stream_connections ${hub.count()}`
     ];
@@ -394,7 +409,10 @@ async function handleApi(req, res, url) {
     // never reach Apple or the cache, so they are not counted.
     stats.count('pageQueries');
     try {
-      const item = await inventory.queryOne({ sku: variant.sku, regionId });
+      // Background auto-refresh (auto=1) reuses anything the monitor fetched within
+      // PAGE_REFRESH_MAX_AGE_MS; only an explicit refresh insists on a live Apple read.
+      const auto = url.searchParams.get('auto') === '1';
+      const item = await inventory.queryOne({ sku: variant.sku, regionId, maxAgeMs: auto ? PAGE_REFRESH_MAX_AGE_MS : undefined });
       if (item.cache === 'HIT') stats.count('cacheHits');
       return json(req, res, 200, {
         ok: true,

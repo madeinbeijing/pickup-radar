@@ -8,6 +8,7 @@ const log = logger.child({ mod: 'state' });
 
 const SCHEMA_VERSION = 4;
 const MAX_EVENTS = 2_000;
+const MAX_RETRY_MS = 30_000;
 
 function emptyState() {
   return { schemaVersion: SCHEMA_VERSION, seq: 0, watches: [], events: [], coverage: [], outbox: { queue: [], deadLetter: [] } };
@@ -37,7 +38,9 @@ export class StateStore {
     this.writing = null;
     this.timer = null;
     this.closed = false;
-    this.stats = { writes: 0, writeErrors: 0, coalesced: 0, lastWriteMs: null, lastWriteAt: null, lastWriteError: null };
+    // `failing` is the current condition, `writeErrors` the history — health needs the former.
+    this.stats = { writes: 0, writeErrors: 0, coalesced: 0, lastWriteMs: null, lastWriteAt: null, lastWriteError: null, failing: false, failStreak: 0 };
+    this.retryAt = 0;             // wall-clock ms before which a background retry must not run
 
     this.bySession = new Map();   // sessionId -> Set<watch>
     this.byId = new Map();        // watchId -> watch
@@ -48,7 +51,18 @@ export class StateStore {
     let raw = null;
     try {
       raw = await readFile(this.filePath, 'utf8');
-    } catch {
+    } catch (error) {
+      // Only a missing file means "first run". Anything else (EACCES after a run under
+      // sudo, EISDIR, EIO) means the state exists but cannot be read — and writing a fresh
+      // empty state here would atomically REPLACE it, erasing every watch and baseline.
+      // Refusing to start costs nothing extra: with no state there is nothing to monitor.
+      if (error?.code !== 'ENOENT') {
+        log.error('state file unreadable, refusing to start', { file: this.filePath, error: error.message });
+        const fatal = new Error(`STATE_UNREADABLE: ${error.message}`);
+        fatal.code = 'STATE_UNREADABLE';
+        fatal.cause = error;
+        throw fatal;
+      }
       await this.flushNow();
       return this;
     }
@@ -69,7 +83,16 @@ export class StateStore {
     } catch (error) {
       // Never start from a half-parsed file: quarantine it so the data is recoverable.
       const quarantine = `${this.filePath}.corrupt-${Date.now()}`;
-      await copyFile(this.filePath, quarantine).catch(() => {});
+      try {
+        await copyFile(this.filePath, quarantine);
+      } catch (copyError) {
+        // Resetting is only safe once a copy exists; otherwise the reset destroys the data.
+        log.error('state file corrupt and could not be quarantined, refusing to start', { error: copyError.message });
+        const fatal = new Error(`STATE_QUARANTINE_FAILED: ${copyError.message}`);
+        fatal.code = 'STATE_QUARANTINE_FAILED';
+        fatal.cause = copyError;
+        throw fatal;
+      }
       log.error('state file corrupt, quarantined and reset', { quarantine, error: error.message });
       this.state = emptyState();
       await this.flushNow();
@@ -122,7 +145,11 @@ export class StateStore {
     if (this.closed) return;
     this.dirty = true;
     if (this.timer) { this.stats.coalesced += 1; return; }
-    this.timer = setTimeout(() => { this.timer = null; this.flushNow().catch(() => {}); }, this.flushDebounceMs);
+    // While the disk is failing, background retries back off instead of re-firing every
+    // debounce period. Mutations keep landing in memory meanwhile; explicit flushNow()
+    // (shutdown) still writes immediately.
+    const delay = Math.max(this.flushDebounceMs, this.retryAt - Date.now());
+    this.timer = setTimeout(() => { this.timer = null; this.flushNow().catch(() => {}); }, delay);
     this.timer.unref?.();
   }
 
@@ -148,11 +175,21 @@ export class StateStore {
         this.stats.writes += 1;
         this.stats.lastWriteMs = Date.now() - started;
         this.stats.lastWriteAt = new Date(this.now()).toISOString();
+        if (this.stats.failStreak) log.info('state flush recovered', { failedAttempts: this.stats.failStreak });
+        this.stats.failing = false;
+        this.stats.failStreak = 0;
+        this.retryAt = 0;
       } catch (error) {
+        const repeated = this.stats.failing && this.stats.lastWriteError === error.message;
         this.stats.writeErrors += 1;
+        this.stats.failStreak += 1;
+        this.stats.failing = true;
         this.stats.lastWriteError = error.message;
         this.dirty = true;                // keep the change pending for the next attempt
-        log.error('state flush failed', { error: error.message });
+        this.retryAt = Date.now() + Math.min(MAX_RETRY_MS, this.flushDebounceMs * 2 ** this.stats.failStreak);
+        // One line per distinct failure, then a periodic reminder — not one per attempt.
+        if (!repeated) log.error('state flush failed', { error: error.message });
+        else if (this.stats.failStreak % 20 === 0) log.warn('state flush still failing', { error: error.message, attempts: this.stats.failStreak });
         // Background (debounced) flushes must not crash the process, but the caller of
         // an explicit flush has to be able to find out. `flushNow` resolves to a result
         // instead of throwing, so both paths can be handled deliberately.

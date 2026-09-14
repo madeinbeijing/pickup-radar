@@ -178,16 +178,16 @@ export class InventoryService {
     this.freshListeners = new Set();            // see onFresh()
 
     this.upstream = { lastSuccessAt: null, lastLatencyMs: null, lastError: null, lastErrorAt: null, lastContractWarning: null, lastParseError: null };
-    this.counters = { requests: 0, retries: 0, failures: 0, contractFailures: 0, contractWarnings: 0, parseErrors: 0, cacheHits: 0, staleServed: 0, harvested: 0, coalesced: 0 };
+    this.counters = { requests: 0, retries: 0, failures: 0, contractFailures: 0, contractWarnings: 0, parseErrors: 0, throttled: 0, cacheHits: 0, staleServed: 0, harvested: 0, coalesced: 0 };
   }
 
   cacheKey(sku, regionId) { return `${sku}|${regionId}`; }
 
-  freshItem(sku, regionId) {
+  freshItem(sku, regionId, freshTtlMs = this.config.freshTtlMs) {
     const hit = this.cache.get(this.cacheKey(sku, regionId));
-    if (!hit) return null;
+    if (!hit || hit.provisional) return null;
     const ageMs = this.now() - hit.at;
-    if (ageMs >= this.config.freshTtlMs) return null;
+    if (ageMs >= freshTtlMs) return null;
     this.counters.cacheHits += 1;
     return { ...hit.value, cache: 'HIT', stale: false, cacheAgeMs: ageMs };
   }
@@ -281,6 +281,7 @@ export class InventoryService {
       } catch (error) {
         this.counters.failures += 1;
         this.recorder?.count('appleFailures');
+        if (error?.throttled) this.counters.throttled += 1;   // read by the monitor's pacing
         if (error?.contract) {
           this.counters.contractFailures += 1;
           log.error('upstream contract broken', { anchor, error: error.code, detail: error.contract.warning });
@@ -302,19 +303,32 @@ export class InventoryService {
    * the region that triggered the request. This is where the cross-city harvest happens.
    */
   harvest({ data, storeIds, fetchedAt, skus, anchor, regions = [] }) {
-    const covered = this.planner.learn(anchor, storeIds);
+    const planned = regions.filter(id => this.catalog.regions[id]);
+    // verify() also records what the anchor covered, so the next plan routes around a miss.
+    const missed = new Set(this.planner.verify(anchor, planned, storeIds));
+    const covered = this.planner.coverageOf(anchor) || new Set();
     const written = [];
     const fresh = [];
 
     // Cache the regions this anchor fully covers (the harvest bonus) *and* the regions
     // this request was issued for. A region Apple answered only partially must still be
     // resolved — its absent stores become `unknown`, which is strictly better than
-    // returning nothing at all for that city.
-    const targets = new Set([...covered, ...regions.filter(id => this.catalog.regions[id])]);
+    // returning nothing at all for that city. Without this, a city whose own anchor
+    // omits one store (a closure, a renovation) would read COVERAGE_MISS every round.
+    const targets = new Set([...covered, ...planned]);
 
     for (const regionId of targets) {
       const regionInfo = this.catalog.regions[regionId];
       if (!regionInfo) continue;
+      // A planned region reached through a NEIGHBOUR's anchor that no longer spans it is
+      // provisional: usable for this round, but never served as fresh. The planner has
+      // just learned the miss, so the next round re-queries it via its own seed store
+      // instead of sitting on `unknown` for a whole fresh TTL. The region's own anchor
+      // answering partially is as good as it gets, so that stays cacheable.
+      const provisional = missed.has(regionId) && anchor !== regionInfo.seedStore;
+      if (missed.has(regionId)) {
+        log.debug('planned region not fully covered', { anchor, region: regionId, provisional });
+      }
       for (const sku of skus) {
         let stores;
         try { stores = reconcileRegionStores(normalizeApplePayload(data, sku), regionInfo); }
@@ -336,15 +350,17 @@ export class InventoryService {
           fetchedAt,
           stores
         };
-        this.cache.set(this.cacheKey(sku, regionId), { at: this.now(), value });
+        this.cache.set(this.cacheKey(sku, regionId), { at: this.now(), value, provisional });
         // Statistics are fed here and only here: harvest sees fresh, contract-valid data,
         // so a cache hit or a stale fallback can never register as an arrival.
         this.recorder?.observe({ sku, regionId, stores, fetchedAt });
         written.push(`${sku}|${regionId}`);
         fresh.push(value);
+        // The harvest bonus: cities resolved that this request was not issued for.
+        if (planned.length && !planned.includes(regionId)) this.counters.harvested += 1;
       }
     }
-    this.counters.harvested += Math.max(0, written.length - skus.length);
+    if (!planned.length) this.counters.harvested += Math.max(0, written.length - skus.length);
     this.emitFresh(fresh);
     return { covered, written };
   }
@@ -373,7 +389,7 @@ export class InventoryService {
    * the coverage planner allows. Never throws: unreachable regions come back as
    * `{ ok:false, status:'unknown' }`, which callers must not treat as "out of stock".
    */
-  async queryPlan(regionSkus, { signal } = {}) {
+  async queryPlan(regionSkus, { signal, freshTtlMs = this.config.freshTtlMs } = {}) {
     const regionIds = [...regionSkus.keys()].filter(id => this.catalog.regions[id]);
     const result = new Map();
     const pending = new Set();
@@ -383,7 +399,7 @@ export class InventoryService {
       const items = {};
       let complete = true;
       for (const sku of regionSkus.get(regionId)) {
-        const fresh = this.freshItem(sku, regionId);
+        const fresh = this.freshItem(sku, regionId, Math.max(freshTtlMs, this.config.freshTtlMs));
         if (fresh) items[sku] = { ok: true, ...fresh };
         else complete = false;
       }
@@ -409,7 +425,7 @@ export class InventoryService {
     // 3. Execute with bounded concurrency.
     const outcomes = await mapPool(chunked, this.config.maxConcurrency, async batch => {
       const cluster = await this.fetchCluster({ anchor: batch.anchor, skus: batch.skus, signal });
-      const { covered } = this.harvest({ ...cluster, skus: batch.skus, anchor: batch.anchor });
+      const { covered } = this.harvest({ ...cluster, skus: batch.skus, anchor: batch.anchor, regions: batch.regions });
       return { batch, covered };
     });
 
@@ -445,10 +461,15 @@ export class InventoryService {
     return result;
   }
 
-  /** Single (sku, region) lookup used by the request path. */
-  async queryOne({ sku, regionId, signal } = {}) {
+  /**
+   * Single (sku, region) lookup used by the request path.
+   * `maxAgeMs` widens what counts as fresh for this call only — a page's background
+   * auto-refresh passes it so it reads what the monitor already fetched instead of
+   * spending an Apple request every 15 seconds.
+   */
+  async queryOne({ sku, regionId, signal, maxAgeMs } = {}) {
     const map = new Map([[regionId, [sku]]]);
-    const plan = await this.queryPlan(map, { signal });
+    const plan = await this.queryPlan(map, { signal, freshTtlMs: maxAgeMs });
     const item = plan.get(regionId)?.[sku];
     if (!item?.ok) {
       const error = new UpstreamError(item?.error || 'UPSTREAM_ERROR');

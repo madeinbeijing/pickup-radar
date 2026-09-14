@@ -4,6 +4,11 @@ import { getProduct, launchPhase, productOfSku } from './catalog.mjs';
 const log = logger.child({ mod: 'monitor' });
 
 const MINUTE = 60_000;
+const MAX_PACE_FACTOR = 32;
+// How far past its due time a round may be (or how long one may run) before the scheduler
+// counts as stalled. Generous on purpose: a laptop waking from sleep fires late once.
+const STALL_GRACE_MS = 2 * MINUTE;
+const MAX_ROUND_MS = 5 * MINUTE;
 
 /**
  * Adaptive stock monitor.
@@ -59,6 +64,14 @@ export class StockMonitor {
     this.currentIntervalMs = this.baseIntervalMs;
     this.lastTransitionAt = 0;
     this.createdAt = this.now();
+    // Throttle-aware pacing (AIMD): every throttled Apple response doubles the cadence,
+    // every clean round afterwards eases it back by 20%. Apple publishes no rate limit,
+    // so the monitor has to find the fastest pace it tolerates rather than guess one.
+    this.pace = { factor: 1, seenThrottled: 0, seenSuccessAt: null };
+    // Outcome of the last round that actually polled. queryPlan never throws — it degrades
+    // to `unknown` — so `lastError` alone would stay clean while every watch goes blind.
+    this.lastRound = null;
+    this.failedRounds = 0;      // consecutive polling rounds in which no watch resolved
     this.counters = { ticks: 0, requests: 0, alerts: 0, suppressed: 0, errors: 0, watchesChecked: 0 };
   }
 
@@ -100,6 +113,31 @@ export class StockMonitor {
    * Choose the delay before the next round.
    * Returns the interval in ms; callers get the reason for observability.
    */
+  /**
+   * Fold what the upstream saw since the last round into the pace factor. Reads the
+   * inventory's counters rather than this round's result, so a throttle triggered by a
+   * page query slows the monitor too — Apple limits the IP, not the caller.
+   */
+  updatePace() {
+    const throttled = this.inventory?.counters?.throttled ?? 0;
+    const successAt = this.inventory?.upstream?.lastSuccessAt ?? null;
+    const pace = this.pace;
+    if (throttled > pace.seenThrottled) {
+      pace.factor = Math.min(MAX_PACE_FACTOR, pace.factor * 2);
+      log.warn('apple throttled, slowing down', { factor: pace.factor });
+    } else if (successAt && successAt !== pace.seenSuccessAt && pace.factor > 1) {
+      pace.factor = Math.max(1, pace.factor * 0.8);
+    }
+    pace.seenThrottled = throttled;
+    pace.seenSuccessAt = successAt;
+    return pace.factor;
+  }
+
+  /** Stretch an active-polling delay by the pace factor, never past maxIntervalMs. */
+  paced(ms) {
+    return Math.min(Math.max(ms, this.maxIntervalMs), Math.round(ms * this.pace.factor));
+  }
+
   nextDelay() {
     const now = this.now();
     const watches = this.store.allWatches().length;
@@ -114,7 +152,7 @@ export class StockMonitor {
 
     // Hot window: minutes either side of any watched product's drop.
     if (this.nextDropDistance() !== null) {
-      return { ms: this.minIntervalMs, reason: 'drop-window' };
+      return { ms: this.paced(this.minIntervalMs), reason: 'drop-window' };
     }
 
     // If every watched product is still pre-launch there is nothing to find. Wake up
@@ -133,7 +171,7 @@ export class StockMonitor {
     // Recent movement means the shelf is live: stay close to base cadence.
     const sinceTransition = now - this.lastTransitionAt;
     if (this.lastTransitionAt && sinceTransition < 10 * MINUTE) {
-      return { ms: this.baseIntervalMs, reason: 'recent-movement' };
+      return { ms: this.paced(this.baseIntervalMs), reason: 'recent-movement' };
     }
 
     // Quiet upstream: widen gradually, but only to quietMaxIntervalMs. Apple never pushes,
@@ -144,7 +182,7 @@ export class StockMonitor {
     // "quiet for decades" and jump straight to the widest interval.
     const quietFor = now - Math.max(this.lastTransitionAt, this.createdAt);
     const quietFactor = Math.min(6, 1 + Math.floor(quietFor / (20 * MINUTE)));
-    return { ms: Math.min(this.quietMaxIntervalMs, this.baseIntervalMs * quietFactor), reason: 'steady-state' };
+    return { ms: this.paced(Math.min(this.quietMaxIntervalMs, this.baseIntervalMs * quietFactor)), reason: 'steady-state' };
   }
 
   start() {
@@ -163,6 +201,7 @@ export class StockMonitor {
       this.tick()
         .catch(error => log.error('tick failed', { error: error.message }))
         .finally(() => {
+          this.updatePace();
           const next = this.nextDelay();
           this.schedule(next.ms, next.reason);
         });
@@ -250,6 +289,11 @@ export class StockMonitor {
       // A round where nothing resolved is invisible otherwise: queryPlan never throws,
       // it degrades to `unknown`. Surface it so a throttled or broken upstream is not
       // mistaken for a quiet one.
+      this.lastRound = {
+        at: new Date(this.now()).toISOString(), total: watches.length, checked, errored, reason: firstError
+      };
+      this.failedRounds = checked === 0 && errored > 0 ? this.failedRounds + 1 : 0;
+
       if (errored) {
         const level = checked === 0 ? 'warn' : 'debug';
         log[level]('round completed with errors', {
@@ -312,6 +356,14 @@ export class StockMonitor {
       // genuine arrival for them. Suppressing it would make "提前布控" pointless: the
       // one moment they armed it for is exactly the moment it would stay silent.
       if (watch.armedBeforeLaunch) {
+        // The flag is spent on the first reading, so that reading has to be live. A stale
+        // one could announce stock that is already gone; worse, adopting it as baseline
+        // would silence the real arrival when the first fresh reading agrees with it.
+        // Skip it untouched — the next fresh reading still alerts immediately.
+        if (item.stale) {
+          log.debug('pre-armed watch skipping stale first reading', { watch: watch.id, ageMs: item.staleAgeMs });
+          return;
+        }
         const available = item.stores.filter(store => store.status === 'available');
         for (const store of available) this.raise(watch, store, 'pre-launch', item, checkedAt);
         this.store.clearArmedFlag(watch.id);
@@ -393,6 +445,19 @@ export class StockMonitor {
     return event;
   }
 
+  /**
+   * Whether the scheduling loop is dead. A monitor whose timer chain broke looks exactly
+   * like a quiet one from the outside — no errors, no alerts — so it has to be derived
+   * from time: a round that is long overdue, or one that never finishes.
+   */
+  stalled() {
+    if (this.stopped) return false;
+    const now = this.now();
+    if (this.running) return now - Date.parse(this.lastRunAt || '') > MAX_ROUND_MS;
+    const dueAt = Date.parse(this.nextRunAt || '');
+    return Number.isFinite(dueAt) && now - dueAt > STALL_GRACE_MS;
+  }
+
   health() {
     const phases = Object.fromEntries(
       Object.keys(this.catalog.products).map(id => [id, this.phase(id)])
@@ -403,12 +468,16 @@ export class StockMonitor {
       intervalMs: this.currentIntervalMs,
       intervalReason: this.scheduleReason || null,
       baseIntervalMs: this.baseIntervalMs,
+      paceFactor: Math.round(this.pace.factor * 100) / 100,
       running: this.running,
       stopped: this.stopped,
       lastRunAt: this.lastRunAt,
       lastRunMs: this.lastRunMs,
       nextRunAt: this.nextRunAt,
       lastError: this.lastError,
+      lastRound: this.lastRound,
+      failedRounds: this.failedRounds,
+      stalled: this.stalled(),
       counters: { ...this.counters }
     };
   }

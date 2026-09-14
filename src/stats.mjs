@@ -61,7 +61,9 @@ export class StatsRecorder {
     this.chain = Promise.resolve();
     this.timer = null;
     this.closed = false;
-    this.health = { appended: 0, writeErrors: 0, lastWriteError: null };
+    // `writeFailing` is the current condition (cleared by the next successful write);
+    // `writeErrors` is history. Health needs the former, or one old error reads as forever.
+    this.health = { appended: 0, writeErrors: 0, lastWriteError: null, writeFailing: false };
     this.skuIndex = this.buildSkuIndex();
   }
 
@@ -227,8 +229,9 @@ export class StatsRecorder {
     const line = JSON.stringify(event) + '\n';
     this.chain = this.chain
       .then(() => appendFile(this.eventsFile(day), line, 'utf8'))
-      .then(() => { this.health.appended += 1; })
+      .then(() => { this.health.appended += 1; this.health.writeFailing = false; })
       .catch(error => {
+        this.health.writeFailing = true;
         this.health.writeErrors += 1;
         this.health.lastWriteError = error.message;
         log.error('stats append failed', { error: error.message });
@@ -249,7 +252,8 @@ export class StatsRecorder {
     if (day !== this.countersDay) return this.chain;
     const body = JSON.stringify({ day, counters: this.counters, firstObservedAt: this.firstObservedAt, lastObservedAt: this.lastObservedAt, savedAt: new Date(this.now()).toISOString() });
     const file = this.countersFile(day);
-    this.chain = this.chain.then(() => atomicWrite(file, body)).catch(error => {
+    this.chain = this.chain.then(() => atomicWrite(file, body)).then(() => { this.health.writeFailing = false; }).catch(error => {
+      this.health.writeFailing = true;
       this.health.writeErrors += 1;
       this.health.lastWriteError = error.message;
       log.error('stats counters write failed', { error: error.message });
@@ -264,7 +268,8 @@ export class StatsRecorder {
     const keys = {};
     for (const [key, entry] of this.state) keys[key] = [entry.available ? 1 : 0, entry.since];
     const body = JSON.stringify({ savedAt: this.now(), day: this.currentDay, keys });
-    this.chain = this.chain.then(() => atomicWrite(this.stateFile(), body)).catch(error => {
+    this.chain = this.chain.then(() => atomicWrite(this.stateFile(), body)).then(() => { this.health.writeFailing = false; }).catch(error => {
+      this.health.writeFailing = true;
       this.health.writeErrors += 1;
       this.health.lastWriteError = error.message;
       log.error('stats state write failed', { error: error.message });

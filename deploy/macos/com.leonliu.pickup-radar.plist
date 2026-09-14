@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.leonliu.pickup-radar</string>
+  <!--
+    caffeinate -w holds a "no idle sleep" assertion for exactly as long as the server lives.
+    exec keeps the node PID equal to the shell's, so launchd's SIGTERM reaches node directly
+    and the server shuts down gracefully (flushes state) instead of being killed.
+  -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>-c</string>
+    <string>/usr/bin/caffeinate -i -w $$ &amp; exec /Users/leonliu/.local/share/fnm/aliases/default/bin/node --env-file=.env server.mjs</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/leonliu/应用开发/Apple</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>/Users/leonliu/Library/Logs/pickup-radar/out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/leonliu/Library/Logs/pickup-radar/err.log</string>
+</dict>
+</plist>

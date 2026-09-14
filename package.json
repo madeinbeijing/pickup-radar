@@ -7,7 +7,7 @@
     "dev": "node server.mjs",
     "start": "NODE_ENV=production node server.mjs",
     "test": "node test.mjs",
-    "check": "node --check server.mjs && node --check src/catalog.mjs && node --check src/inventory.mjs && node --check src/monitor.mjs && node --check src/state-store.mjs && node --check src/coverage.mjs && node --check src/resilience.mjs && node --check src/upstream.mjs && node --check src/notifier.mjs && node --check notify-test.mjs && node --check src/logger.mjs && node --check verify-catalog.mjs && node --check src/stats.mjs && node --check public/stats.js && node --check public/request-guard.js && node --check public/app.js && node test.mjs",
+    "check": "node --check server.mjs && node --check src/catalog.mjs && node --check src/inventory.mjs && node --check src/monitor.mjs && node --check src/state-store.mjs && node --check src/coverage.mjs && node --check src/resilience.mjs && node --check src/upstream.mjs && node --check src/notifier.mjs && node --check notify-test.mjs && node --check src/logger.mjs && node --check verify-catalog.mjs && node --check src/stats.mjs && node --check src/health.mjs && node --check public/stats.js && node --check public/request-guard.js && node --check public/app.js && node test.mjs",
     "notify:test": "node --env-file=.env notify-test.mjs",
     "smoke:apple": "node live-smoke.mjs",
     "verify:catalog": "node verify-catalog.mjs",

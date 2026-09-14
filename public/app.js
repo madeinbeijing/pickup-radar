@@ -444,7 +444,7 @@ function scheduleRefresh() {
   clearInterval(state.timer);
   if (!state.autoRefresh || phase() === 'prelaunch') return;
   state.timer = setInterval(() => {
-    if (document.visibilityState === 'visible' && !state.loading) refresh({ silent: true });
+    if (document.visibilityState === 'visible' && !state.loading) refresh({ silent: true, auto: true });
   }, 15_000);
 }
 
@@ -453,7 +453,7 @@ const selectionNow = () => ({
   product: state.product, capacity: state.capacity, color: state.color, region: state.region
 });
 
-async function refresh({ forceDemo = false, silent = false } = {}) {
+async function refresh({ forceDemo = false, silent = false, auto = false } = {}) {
   // Never drop a new request just because one is in flight — see request-guard.js.
   const token = guard.begin(selectionNow());
   state.loading = true;
@@ -473,7 +473,7 @@ async function refresh({ forceDemo = false, silent = false } = {}) {
     const useDemo = forceDemo || state.demo;
     const endpoint = useDemo
       ? `/api/demo?region=${encodeURIComponent(state.region)}`
-      : `/api/availability?product=${encodeURIComponent(state.product)}&capacity=${encodeURIComponent(state.capacity)}&color=${encodeURIComponent(state.color)}&region=${encodeURIComponent(state.region)}`;
+      : `/api/availability?product=${encodeURIComponent(state.product)}&capacity=${encodeURIComponent(state.capacity)}&color=${encodeURIComponent(state.color)}&region=${encodeURIComponent(state.region)}${auto ? '&auto=1' : ''}`;
 
     const response = await fetch(endpoint, { cache: 'no-store', signal: token.signal });
     const result = await response.json();
@@ -657,7 +657,7 @@ function connectEventStream() {
       chime.play();
       toast(`Apple ${event.storeName} 已显示可取货`);
       await showStockNotification(event);
-      if (event.sku === currentVariant()?.sku && event.region === state.region) refresh({ silent: true });
+      if (event.sku === currentVariant()?.sku && event.region === state.region) refresh({ silent: true, auto: true });
       await loadWatches();
     } catch {}
   });
@@ -806,7 +806,7 @@ function setupEvents() {
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible') {
       loadWatches();
-      if (state.autoRefresh) refresh({ silent: true });
+      if (state.autoRefresh) refresh({ silent: true, auto: true });
     }
   });
 }

@@ -6,11 +6,16 @@ import { backoffDelay, sleep } from './resilience.mjs';
  * re-handshaking every time. A `node:https` Agent would be silently ignored here.
  */
 
+// Throttle responses. Apple rate-limits with the non-standard 541 as well as 429. These
+// are NOT retried within the request: a retry seconds later is almost always throttled
+// again and only deepens the limit (measured: ~250 retries rescued a dozen requests).
+// They fail fast, feed the circuit breaker, and the monitor widens its cadence instead.
+export const THROTTLE_STATUSES = new Set([429, 541]);
+
 // 4xx codes worth retrying. Everything else in 4xx is a contract error that retrying
-// cannot fix. Any 5xx is retryable — Apple throttles with non-standard codes such as
-// 541, so enumerating the standard ones is not enough.
-const RETRYABLE_4XX = new Set([408, 425, 429]);
-const isRetryableStatus = status => status >= 500 || RETRYABLE_4XX.has(status);
+// cannot fix. Any other 5xx is retryable, so a non-standard server error still recovers.
+const RETRYABLE_4XX = new Set([408, 425]);
+const isRetryableStatus = status => !THROTTLE_STATUSES.has(status) && (status >= 500 || RETRYABLE_4XX.has(status));
 const RETRYABLE_SYSCALL = new Set([
   'ECONNRESET', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN',
   'ETIMEDOUT', 'EPIPE', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_SOCKET'
@@ -23,6 +28,7 @@ export class UpstreamError extends Error {
     this.code = code;
     this.status = status;
     this.retryable = retryable;
+    this.throttled = THROTTLE_STATUSES.has(status);
     this.cause = cause;
   }
 }
@@ -61,8 +67,8 @@ const DEFAULT_HEADERS = {
  * GET JSON with bounded retries.
  *
  * Only retries idempotent reads on genuinely transient conditions (timeout, socket
- * error, 5xx, 429). A 4xx other than 429 is a contract problem: retrying cannot fix it
- * and only adds load, so it fails immediately.
+ * error, 5xx other than throttling). Throttling (429, 541) and other 4xx fail
+ * immediately: retrying cannot fix them and only adds load.
  */
 export async function fetchJson(url, {
   fetchImpl = fetch,

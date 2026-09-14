@@ -155,7 +155,7 @@ const pushplusCheck = body => (body?.code === 200 ? null : `${body?.code ?? 'NO_
  * drop alerts that were mid-retry.
  */
 export class Notifier {
-  constructor({ hub, store = null, barkUrl = '', barkSound = 'alarm', barkCall = true, barkLevel = 'timeSensitive', barkVolume = 10, ntfyUrl = '', feishuUrl = '', feishuSecret = '', wecomUrl = '', pushplusToken = '', maxAttempts = 4, timeoutMs = 6_000, maxQueue = 500, retryBaseMs = 500 } = {}) {
+  constructor({ hub, store = null, barkUrl = '', barkSound = 'shake', barkCall = true, barkLevel = 'timeSensitive', barkVolume = 10, ntfyUrl = '', feishuUrl = '', feishuSecret = '', wecomUrl = '', pushplusToken = '', maxAttempts = 4, timeoutMs = 6_000, maxQueue = 500, retryBaseMs = 500 } = {}) {
     this.hub = hub;
     this.store = store;          // optional StateStore, for a durable outbox
     this.maxAttempts = maxAttempts;
@@ -384,6 +384,7 @@ export class Notifier {
       queuedByChannel: byChannel,
       durable: Boolean(this.store),
       deadLettered: this.deadLetter.length,
+      lastDeadLetterAt: this.deadLetter.at(-1)?.at || null,
       lastError: this.lastError
     };
   }

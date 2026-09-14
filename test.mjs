@@ -13,6 +13,8 @@ import { StockMonitor } from './src/monitor.mjs';
 import { EventHub, Notifier, feishuSign, notifierOptionsFromEnv } from './src/notifier.mjs';
 import { RequestGuard, sameSelection } from './public/request-guard.js';
 import { StatsRecorder, summarize, ledger, buildIntervals, dayKey, dayStart } from './src/stats.mjs';
+import { assessHealth } from './src/health.mjs';
+import { chmod } from 'node:fs/promises';
 
 let passed = 0;
 const failures = [];
@@ -282,6 +284,48 @@ await test('无可信缓存时返回 unknown，绝不返回“无货”', async 
   assert.equal(item.ok, false);
   assert.equal(item.status, 'unknown');
 });
+// A cluster in which one Tianjin store (R638) is absent from Apple's response.
+const WITHOUT_R638 = structuredClone(SAMPLE);
+WITHOUT_R638.body.stores = WITHOUT_R638.body.stores.filter(store => store.storeNumber !== 'R638');
+await test('覆盖图失准：邻城锚点漏店时，计划内的城市仍有结果，且下一轮立即改走本城锚点', async () => {
+  const clock = fakeClock();
+  const anchors = [];
+  let response = WITHOUT_R638;
+  const inv = new InventoryService({
+    catalog, now: clock.now, freshTtlMs: 60_000, retries: 0,
+    fetchImpl: async url => { anchors.push(new URL(url).searchParams.get('store')); return okResponse(response); }
+  });
+  inv.planner.learn('R320', ['R320', 'R448', 'R479', 'R388', 'R645', 'R792', 'R579', 'R637', 'R638']);
+  const plan = new Map([['beijing', ['MJY74CH/A']], ['tianjin', ['MJY74CH/A']]]);
+
+  const first = await inv.queryPlan(plan);
+  assert.deepEqual(anchors, ['R320'], '先验认为北京锚点覆盖两城');
+  const tianjin = first.get('tianjin')['MJY74CH/A'];
+  assert.equal(tianjin.ok, true, '天津不得整体变成 COVERAGE_MISS');
+  assert.equal(tianjin.stores.find(store => store.id === 'R579').status, 'available', '响应里有的门店照常判定');
+  assert.equal(tianjin.stores.find(store => store.id === 'R638').status, 'unknown', '缺席门店只能是 unknown');
+  assert.equal(inv.planner.snapshot().coverageMisses, 1);
+
+  clock.advance(1_000);                     // 远小于 fresh TTL
+  response = SAMPLE;
+  await inv.queryPlan(plan);
+  assert.deepEqual(anchors, ['R320', 'R579'], '临时结果不得当作新鲜缓存，否则天津要空等一个 TTL');
+});
+await test('本城锚点自身漏店时，城市每轮都有结果（不会长期失明）', async () => {
+  const clock = fakeClock();
+  let calls = 0;
+  const inv = new InventoryService({
+    catalog, now: clock.now, freshTtlMs: 1, retries: 0,
+    fetchImpl: async () => { calls += 1; return okResponse(WITHOUT_R638); }
+  });
+  for (let round = 0; round < 3; round += 1) {
+    const item = (await inv.queryPlan(new Map([['tianjin', ['MJY74CH/A']]]))).get('tianjin')['MJY74CH/A'];
+    assert.equal(item.ok, true, `第 ${round + 1} 轮天津不得 COVERAGE_MISS`);
+    assert.equal(item.stale, false);
+    clock.advance(10);
+  }
+  assert.equal(calls, 3);
+});
 await test('并发相同请求被合并', async () => {
   let calls = 0;
   const inv = new InventoryService({
@@ -384,21 +428,26 @@ await test('5xx 重试，4xx 立即失败', async () => {
   }));
   assert.equal(calls, 1, '400 不可重试');
 });
-await test('Apple 非标准限流码 541 必须可重试（实测遇到）', async () => {
-  let calls = 0;
-  await assert.rejects(fetchJson('https://x', {
-    retries: 2, random: () => 0,
-    fetchImpl: async () => { calls += 1; return { ok: false, status: 541, headers: { get: () => null } }; }
-  }));
-  assert.equal(calls, 3, '任意 5xx 都应重试，不能只枚举 500/502/503/504');
+await test('Apple 限流码 541 / 429 不在请求内重试，并标记为限流', async () => {
+  for (const status of [541, 429]) {
+    let calls = 0;
+    const error = await fetchJson('https://x', {
+      retries: 2, random: () => 0,
+      fetchImpl: async () => { calls += 1; return { ok: false, status, headers: { get: h => h === 'retry-after' ? '0' : null } }; }
+    }).catch(e => e);
+    assert.equal(calls, 1, `${status} 被限流时立即重试只会加重限流`);
+    assert.equal(error.throttled, true);
+    assert.equal(error.retryable, false);
+  }
 });
-await test('429 可重试且遵守 Retry-After', async () => {
+await test('非限流的非标准 5xx 仍然可重试', async () => {
   let calls = 0;
-  await assert.rejects(fetchJson('https://x', {
-    retries: 1, random: () => 0,
-    fetchImpl: async () => { calls += 1; return { ok: false, status: 429, headers: { get: h => h === 'retry-after' ? '0' : null } }; }
-  }));
-  assert.equal(calls, 2);
+  const error = await fetchJson('https://x', {
+    retries: 2, random: () => 0,
+    fetchImpl: async () => { calls += 1; return { ok: false, status: 599, headers: { get: () => null } }; }
+  }).catch(e => e);
+  assert.equal(calls, 3, '不能只枚举 500/502/503/504');
+  assert.equal(error.throttled, false);
 });
 await test('重试后成功返回结果', async () => {
   let calls = 0;
@@ -500,6 +549,35 @@ await test('v3 的 upgrade 字段在迁移时被清除', async () => {
   const watch = store.allWatches()[0];
   assert.equal('upgrade' in watch, false, '功能已移除，死字段不得残留');
   assert.equal(watch.product, 'iphone-duo', '应由 SKU 反查出机型');
+  await store.close();
+});
+await test('状态文件存在但不可读时拒绝启动，绝不用空状态覆盖（会抹掉全部关注）', async () => {
+  if (process.getuid?.() === 0) return;   // root 无视文件权限，无法构造该场景
+  const path = join(dir, 'unreadable.json');
+  const original = JSON.stringify({ schemaVersion: 4, seq: 1, events: [], coverage: [],
+    watches: [{ id: 'w1', sessionId: 's', enabled: true, sku: 'MJY74CH/A', region: 'beijing' }] });
+  await writeFile(path, original, 'utf8');
+  await chmod(path, 0o000);
+  try {
+    await assert.rejects(() => new StateStore(path).init(), /STATE_UNREADABLE/);
+  } finally {
+    await chmod(path, 0o600);
+  }
+  assert.equal(await readFile(path, 'utf8'), original, '原状态文件必须原封不动');
+});
+await test('落盘持续失败时退避重试，而不是每个去抖周期刷一次错误', async () => {
+  const store = await new StateStore(join(dir, 'backoff.json'), { flushDebounceMs: 5 }).init();
+  const realPath = store.filePath;
+  store.filePath = '/nonexistent-dir-xyz/state.json';
+  store.createWatch('s', { sku: 'X', region: 'beijing' });
+  await new Promise(resolve => setTimeout(resolve, 400));
+  const attempts = store.stats.writeErrors;
+  assert.ok(attempts >= 2, '仍需在后台重试');
+  assert.ok(attempts <= 8, `400ms 内不应重试 ${attempts} 次（固定 5ms 去抖约 60 次）`);
+  assert.equal(store.stats.failing, true);
+  store.filePath = realPath;
+  assert.equal((await store.flushNow()).ok, true, '显式落盘不受退避限制');
+  assert.equal(store.stats.failing, false, '恢复后清除故障状态');
   await store.close();
 });
 await test('损坏的状态文件被隔离而非静默丢弃', async () => {
@@ -704,6 +782,61 @@ await test('提前布控首轮无货时不误报，后续到货正常提醒', as
   await mon.tick();
   assert.equal(store.listEvents('s').length, 1, '随后到货应正常提醒');
 });
+await test('提前布控：首个读数是 stale 时不提醒、不消费标记，随后的新鲜读数立即提醒', async () => {
+  const clock = fakeClock();
+  const store = await new StateStore(join(dir, 'p4.json'), { flushDebounceMs: 5, now: clock.now }).init();
+  const mon = new StockMonitor({ inventory: {}, store, catalog, notifier: new Notifier({ hub: new EventHub() }), now: clock.now });
+  const watch = store.createWatch('s', { armedBeforeLaunch: true, product: 'iphone-18-pro-max', sku: 'MJY74CH/A', region: 'beijing' });
+  const reading = stale => ({
+    ok: true, stale, staleAgeMs: stale ? 300_000 : undefined, fetchedAt: new Date(clock.now()).toISOString(),
+    stores: [{ id: 'R320', name: '三里屯', status: 'available' }]
+  });
+  mon.evaluate(store.getWatch(watch.id), reading(true));
+  assert.equal(store.listEvents('s').length, 0, '过期缓存里的有货可能早已售罄');
+  assert.equal(store.getWatch(watch.id).armedBeforeLaunch, true, '标记必须留给第一个新鲜读数');
+  assert.equal(store.getWatch(watch.id).lastStates, null, 'stale 读数不得成为基线');
+  clock.advance(1_000);
+  mon.evaluate(store.getWatch(watch.id), reading(false));
+  assert.equal(store.listEvents('s').length, 1, '新鲜读数到来时立即提醒');
+  await store.close();
+});
+await test('整轮无一关注解析成功时记录失败轮次；成功一次即清零', async () => {
+  const clock = fakeClock();
+  const store = await new StateStore(join(dir, 'r1.json'), { flushDebounceMs: 5, now: clock.now }).init();
+  let fail = true;
+  const inv = new InventoryService({
+    catalog, now: clock.now, freshTtlMs: 1, retries: 0, failureThreshold: 100,
+    fetchImpl: async () => { if (fail) throw Object.assign(new Error('boom'), { code: 'ECONNRESET' }); return okResponse(SAMPLE); }
+  });
+  const mon = new StockMonitor({ inventory: inv, store, catalog, notifier: new Notifier({ hub: new EventHub() }), now: clock.now });
+  store.createWatch('s', { sku: 'MJY74CH/A', region: 'beijing' });
+  await mon.tick();  clock.advance(30_000);
+  await mon.tick();
+  assert.equal(mon.health().lastError, null, 'queryPlan 不抛错，lastError 看不到这种失败');
+  assert.equal(mon.health().failedRounds, 2);
+  assert.equal(mon.health().lastRound.checked, 0);
+  fail = false;
+  clock.advance(30_000);
+  await mon.tick();
+  assert.equal(mon.health().failedRounds, 0);
+  await store.close();
+});
+await test('调度链断掉（下一轮严重逾期）时判定为 stalled', () => {
+  const clock = fakeClock();
+  const mon = new StockMonitor({ inventory: {}, store: { allWatches: () => [] }, catalog, notifier: null, now: clock.now });
+  assert.equal(mon.stalled(), false, '未启动的监控不算停摆');
+  mon.stopped = false;
+  mon.nextRunAt = new Date(clock.now() + 30_000).toISOString();
+  clock.advance(60_000);
+  assert.equal(mon.stalled(), false, '稍有延迟（如休眠唤醒）不算停摆');
+  clock.advance(5 * 60_000);
+  assert.equal(mon.stalled(), true);
+  mon.running = true;
+  mon.lastRunAt = new Date(clock.now() - 60_000).toISOString();
+  assert.equal(mon.stalled(), false, '正在执行的轮次不算逾期');
+  mon.lastRunAt = new Date(clock.now() - 10 * 60_000).toISOString();
+  assert.equal(mon.stalled(), true, '一轮卡住不结束也是停摆');
+});
 await test('页面查询拿到的新读数立即触发提醒，不等下一轮', async () => {
   const clock = fakeClock();
   const store = await new StateStore(join(dir, 'o1.json'), { flushDebounceMs: 5, now: clock.now }).init();
@@ -770,6 +903,38 @@ await test('新读数监听器抛错不影响查询本身', async () => {
   assert.equal(item.stores.length, 6);
 });
 
+await test('限流响应计入 throttled，供监控调速', async () => {
+  const clock = fakeClock();
+  let calls = 0;
+  const inv = new InventoryService({
+    catalog, now: clock.now, retries: 2,
+    fetchImpl: async () => { calls += 1; return { ok: false, status: 541, headers: { get: () => null } }; }
+  });
+  await assert.rejects(inv.queryOne({ sku: 'MJY74CH/A', regionId: 'beijing' }));
+  assert.equal(calls, 1);
+  assert.equal(inv.counters.throttled, 1);
+});
+await test('网页自动刷新（maxAgeMs）复用监控已拿到的数据，不重复请求 Apple', async () => {
+  const clock = fakeClock();
+  let calls = 0;
+  const inv = new InventoryService({
+    catalog, now: clock.now, freshTtlMs: 12_000, retries: 0,
+    fetchImpl: async () => { calls += 1; return okResponse(SAMPLE); }
+  });
+  await inv.queryOne({ sku: 'MJY74CH/A', regionId: 'beijing' });
+  clock.advance(30_000);
+  const auto = await inv.queryOne({ sku: 'MJY74CH/A', regionId: 'beijing', maxAgeMs: 120_000 });
+  assert.equal(calls, 1, '两分钟内的缓存足够自动刷新使用');
+  assert.equal(auto.cache, 'HIT');
+  await inv.queryOne({ sku: 'MJY74CH/A', regionId: 'beijing' });
+  assert.equal(calls, 2, '手动刷新仍然实时查询');
+  clock.advance(130_000);
+  await inv.queryOne({ sku: 'MJY74CH/A', regionId: 'beijing', maxAgeMs: 120_000 });
+  assert.equal(calls, 3, '缓存过旧时自动刷新也要查询');
+  await inv.queryOne({ sku: 'MJY74CH/A', regionId: 'beijing', maxAgeMs: 1 });
+  assert.equal(calls, 3, 'maxAgeMs 只能放宽，不能比默认新鲜期更严');
+});
+
 // --------------------------------------------------------- scheduling ----
 group('自适应调度');
 function schedulerFixture(overrides = {}) {
@@ -781,6 +946,30 @@ function schedulerFixture(overrides = {}) {
   });
   return { mon, clock };
 }
+await test('被限流时间隔加倍，恢复后逐步缩回，且不超过最长间隔', () => {
+  const inventory = { breaker: { state: 'closed', retryAfterMs: () => 0 }, counters: { throttled: 0 }, upstream: { lastSuccessAt: null } };
+  const { mon } = schedulerFixture({ inventory });
+  const base = mon.nextDelay().ms;
+
+  inventory.counters.throttled = 1;
+  mon.updatePace();
+  assert.equal(mon.nextDelay().ms, base * 2, '一次限流，间隔翻倍');
+  inventory.counters.throttled = 3;   // 两轮之间发生多次限流（含网页查询触发的）只算一次加倍
+  mon.updatePace();
+  assert.equal(mon.nextDelay().ms, base * 4);
+
+  mon.updatePace();
+  assert.equal(mon.nextDelay().ms, base * 4, '没有新的成功也没有新的限流时保持不变');
+  inventory.upstream.lastSuccessAt = 't1';
+  mon.updatePace();
+  assert.equal(mon.nextDelay().ms, Math.round(base * 3.2), '成功一轮缩短 20%');
+  for (let i = 0; i < 20; i += 1) { inventory.upstream.lastSuccessAt = `t${i + 2}`; mon.updatePace(); }
+  assert.equal(mon.nextDelay().ms, base, '持续成功后回到正常节奏');
+
+  for (let i = 0; i < 12; i += 1) { inventory.counters.throttled += 1; mon.updatePace(); }
+  assert.equal(mon.nextDelay().ms, mon.maxIntervalMs, '再怎么限流也不超过最长间隔');
+  assert.equal(mon.health().paceFactor, 32);
+});
 await test('无关注时退到最长间隔', () => {
   const { mon } = schedulerFixture({ store: { allWatches: () => [] } });
   assert.equal(mon.nextDelay().reason, 'idle-no-watches');
@@ -1231,7 +1420,7 @@ await test('Bark 默认响铃醒目：持续铃声 + 时效性通知', () => {
   const payload = n => JSON.parse(n.channels[0].build(n.channels[0].url, event).init.body);
 
   const loud = payload(new Notifier({ hub: new EventHub(), ...notifierOptionsFromEnv({ BARK_URL: 'https://api.day.app/k/' }) }));
-  assert.equal(loud.sound, 'alarm');
+  assert.equal(loud.sound, 'shake');
   assert.equal(loud.call, '1', '默认应持续响铃');
   assert.equal(loud.level, 'timeSensitive');
   assert.equal(loud.volume, undefined, 'volume 只对 critical 生效');
@@ -1286,6 +1475,54 @@ await test('单个客户端写入异常不影响其他订阅者', () => {
   hub.add('s', { write: chunk => good.push(chunk) });
   assert.doesNotThrow(() => hub.emit('s', { seq: 1 }));
   assert.equal(good.length, 1);
+});
+
+// ------------------------------------------------------------- health -----
+group('健康检查');
+const healthy = () => ({
+  inventory: { circuit: { state: 'closed' }, upstream: {} },
+  monitor: { stalled: false, lastError: null, failedRounds: 0, lastRound: { checked: 3, errored: 0 } },
+  state: { failing: false }, stats: { writeFailing: false }, notifications: { lastDeadLetterAt: null },
+  now: Date.parse('2026-09-20T10:00:00Z')
+});
+await test('一切正常时 ok / 200 且无原因', () => {
+  assert.deepEqual(assessHealth(healthy()), { status: 'ok', httpStatus: 200, problems: [], warnings: [] });
+});
+await test('无法发现到货（停摆 / 连续整轮失败 / 熔断）返回 503', () => {
+  for (const [mutate, reason] of [
+    [h => { h.monitor.stalled = true; }, 'monitor-stalled'],
+    [h => { h.monitor.failedRounds = 2; h.monitor.lastRound = { checked: 0, errored: 3 }; }, 'rounds-failing'],
+    [h => { h.inventory.circuit.state = 'open'; }, 'circuit-open']
+  ]) {
+    const input = healthy();
+    mutate(input);
+    const verdict = assessHealth(input);
+    assert.equal(verdict.httpStatus, 503, reason);
+    assert.ok(verdict.problems.includes(reason));
+  }
+});
+await test('单轮整体失败只算降级，不让探针抖动', () => {
+  const input = healthy();
+  input.monitor.failedRounds = 1;
+  input.monitor.lastRound = { checked: 0, errored: 3 };
+  const verdict = assessHealth(input);
+  assert.equal(verdict.status, 'degraded');
+  assert.equal(verdict.httpStatus, 200);
+});
+await test('持久化失败、统计写入失败、近期死信：降级但仍为 200，且列出原因', () => {
+  const input = healthy();
+  input.state.failing = true;
+  input.stats.writeFailing = true;
+  input.notifications.lastDeadLetterAt = new Date(input.now - 5 * 60_000).toISOString();
+  const verdict = assessHealth(input);
+  assert.equal(verdict.status, 'degraded');
+  assert.equal(verdict.httpStatus, 200, '提醒仍在正常工作，不能让守护进程重启它');
+  assert.deepEqual(verdict.warnings, ['state-persist-failing', 'stats-write-failing', 'notification-dead-lettered']);
+
+  input.state.failing = false;
+  input.stats.writeFailing = false;
+  input.notifications.lastDeadLetterAt = new Date(input.now - 2 * 3600_000).toISOString();
+  assert.equal(assessHealth(input).status, 'ok', '很久以前的死信不应永久挂黄');
 });
 
 await rm(dir, { recursive: true, force: true });
