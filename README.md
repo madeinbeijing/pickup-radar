@@ -66,11 +66,13 @@ Apple 单次请求可接受全部 16 个 SKU，因此"整条产品线 × 一个�
 |---|---|
 | 预售/发售窗口前后 | 最快（10s） |
 | 刚发生过状态变化 | 基准节奏 |
-| 长期无变化 | 逐级拉长，最长 15 分钟 |
+| 长期无变化 | 逐级拉长，最长 60 秒（`MONITOR_QUIET_MAX_MS`）；重启后从启动时刻起算 |
 | 熔断打开 | 遵守熔断冷却，不再压上游 |
 | 无人关注 | 最长间隔 |
 
 新增关注会立刻**唤醒**调度器，不必空等一个长睡眠。
+
+轮询之外，**任何一次新鲜的 Apple 读数**（页面刷新、跨城收割顺带拿到的城市）落入缓存时都会立即对照关注判定，不额外消耗上游请求；轮询轮次只是兜底。
 
 ### 5. 告警质量
 
@@ -171,7 +173,23 @@ npm run dev
 
 ## 配置
 
-见 `.env.example`，全部配置项都有注释。
+见 `.env.example`，全部配置项都有注释。服务端不会自动读取 `.env`，启动时用 `node --env-file=.env server.mjs`。
+
+### 手机推送
+
+关掉网页后要收到到货提醒，至少配置一个服务端推送渠道。可以同时配置多个，各渠道独立重试，互不影响。
+
+| 渠道 | 配置项 | 收在哪里 |
+|---|---|---|
+| Bark | `BARK_URL`，铃声与响铃方式见 `BARK_SOUND` / `BARK_CALL` / `BARK_LEVEL` / `BARK_VOLUME` | iPhone Bark App |
+| ntfy | `NTFY_URL` | ntfy App（服务器在境外） |
+| 飞书群机器人 | `FEISHU_WEBHOOK_URL`，开启签名校验时加 `FEISHU_SECRET` | 飞书群 |
+| 企业微信群机器人 | `WECOM_WEBHOOK_URL` | 企业微信群 |
+| PushPlus | `PUSHPLUS_TOKEN` | 个人微信（PushPlus 公众号） |
+
+配好后运行 `npm run notify:test`，会向所有已配置的渠道发一条测试提醒并打印结果。
+
+飞书、企业微信、PushPlus 被拒收时也会返回 HTTP 200，服务端会检查响应体，拒收计为失败并重试。原因见 `/api/health` 的 `notifications.channels[].lastError`。所有渠道都是全局配置，所有用户的到货都推到同一处。
 
 ## 到货统计
 

@@ -175,6 +175,7 @@ export class InventoryService {
     this.gate = new Semaphore(this.config.maxConcurrency);
     this.planner = options.planner || new CoveragePlanner({ catalog: this.catalog, now: this.now });
     this.recorder = options.recorder || null;   // optional StatsRecorder
+    this.freshListeners = new Set();            // see onFresh()
 
     this.upstream = { lastSuccessAt: null, lastLatencyMs: null, lastError: null, lastErrorAt: null, lastContractWarning: null, lastParseError: null };
     this.counters = { requests: 0, retries: 0, failures: 0, contractFailures: 0, contractWarnings: 0, parseErrors: 0, cacheHits: 0, staleServed: 0, harvested: 0, coalesced: 0 };
@@ -303,6 +304,7 @@ export class InventoryService {
   harvest({ data, storeIds, fetchedAt, skus, anchor, regions = [] }) {
     const covered = this.planner.learn(anchor, storeIds);
     const written = [];
+    const fresh = [];
 
     // Cache the regions this anchor fully covers (the harvest bonus) *and* the regions
     // this request was issued for. A region Apple answered only partially must still be
@@ -339,10 +341,31 @@ export class InventoryService {
         // so a cache hit or a stale fallback can never register as an arrival.
         this.recorder?.observe({ sku, regionId, stores, fetchedAt });
         written.push(`${sku}|${regionId}`);
+        fresh.push(value);
       }
     }
     this.counters.harvested += Math.max(0, written.length - skus.length);
+    this.emitFresh(fresh);
     return { covered, written };
+  }
+
+  /**
+   * Subscribe to every fresh, contract-valid reading harvest() writes — whichever caller
+   * paid for the request. Same guarantee as the stats feed: never a cache hit or stale
+   * fallback. Returns an unsubscribe function.
+   */
+  onFresh(listener) {
+    this.freshListeners.add(listener);
+    return () => this.freshListeners.delete(listener);
+  }
+
+  emitFresh(readings) {
+    if (!readings.length) return;
+    for (const listener of this.freshListeners) {
+      // A listener bug must never fail the query that happened to feed it.
+      try { listener(readings); }
+      catch (error) { log.error('fresh-reading listener failed', { error: error?.message }); }
+    }
   }
 
   /**

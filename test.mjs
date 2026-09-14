@@ -10,7 +10,7 @@ import { CircuitBreaker, TokenBucket, Semaphore, backoffDelay, mapPool } from '.
 import { fetchJson, parseRetryAfter, classify } from './src/upstream.mjs';
 import { StateStore } from './src/state-store.mjs';
 import { StockMonitor } from './src/monitor.mjs';
-import { EventHub, Notifier } from './src/notifier.mjs';
+import { EventHub, Notifier, feishuSign, notifierOptionsFromEnv } from './src/notifier.mjs';
 import { RequestGuard, sameSelection } from './public/request-guard.js';
 import { StatsRecorder, summarize, ledger, buildIntervals, dayKey, dayStart } from './src/stats.mjs';
 
@@ -704,6 +704,71 @@ await test('提前布控首轮无货时不误报，后续到货正常提醒', as
   await mon.tick();
   assert.equal(store.listEvents('s').length, 1, '随后到货应正常提醒');
 });
+await test('页面查询拿到的新读数立即触发提醒，不等下一轮', async () => {
+  const clock = fakeClock();
+  const store = await new StateStore(join(dir, 'o1.json'), { flushDebounceMs: 5, now: clock.now }).init();
+  const inv = monitorFixture({ clock, responses: [NONE, SAMPLE] });
+  const mon = new StockMonitor({ inventory: inv, store, catalog, notifier: new Notifier({ hub: new EventHub() }), now: clock.now });
+  inv.onFresh(readings => mon.observe(readings));
+  store.createWatch('s', { sku: 'MJY74CH/A', region: 'beijing', capacity: '256GB', color: 'silver' });
+  await mon.tick();                                   // 基线：无货
+  const roundsBefore = mon.counters.ticks;
+  clock.advance(30_000);
+  await inv.queryOne({ sku: 'MJY74CH/A', regionId: 'beijing' });   // 页面刷新
+  assert.equal(mon.counters.ticks, roundsBefore, '这里没有跑监控轮');
+  assert.equal(store.listEvents('s').length, 1, '页面查询发现到货应立即提醒');
+  await store.close();
+});
+await test('跨城收割顺带拿到的城市也立即判定', async () => {
+  const clock = fakeClock();
+  const store = await new StateStore(join(dir, 'o2.json'), { flushDebounceMs: 5, now: clock.now }).init();
+  const inv = monitorFixture({ clock, responses: [NONE, SAMPLE] });
+  const mon = new StockMonitor({ inventory: inv, store, catalog, notifier: new Notifier({ hub: new EventHub() }), now: clock.now });
+  inv.onFresh(readings => mon.observe(readings));
+  store.createWatch('s', { sku: 'MJY74CH/A', region: 'tianjin', capacity: '256GB', color: 'silver' });
+  await mon.tick();                                   // 天津基线：无货；规划器学到簇
+  clock.advance(30_000);
+  await inv.queryOne({ sku: 'MJY74CH/A', regionId: 'beijing' });   // 有人查的是北京
+  const events = store.listEvents('s');
+  assert.equal(events.length, 1, '北京请求顺带收割的天津到货应立即提醒');
+  assert.equal(events[0].storeId, 'R579');
+  await store.close();
+});
+await test('本轮自身收割已判定过的读数，轮内不重复判定', async () => {
+  const clock = fakeClock();
+  const store = await new StateStore(join(dir, 'o3.json'), { flushDebounceMs: 5, now: clock.now }).init();
+  const inv = monitorFixture({ clock, responses: [NONE, NONE, SAMPLE] });
+  const mon = new StockMonitor({ inventory: inv, store, catalog, notifier: new Notifier({ hub: new EventHub() }), alertCooldownMs: 0, now: clock.now });
+  inv.onFresh(readings => mon.observe(readings));
+  store.createWatch('s', { sku: 'MJY74CH/A', region: 'beijing', capacity: '256GB', color: 'silver' });
+  await mon.tick();  clock.advance(30_000);
+  await mon.tick();  clock.advance(30_000);
+  await mon.tick();                                   // 收割时 observe 报警一次，随后轮内判定必须跳过
+  assert.equal(store.listEvents('s').length, 1, '冷却为 0 时重复判定会报两次');
+  await store.close();
+});
+await test('乱序到达的旧读数不得回滚基线', async () => {
+  const clock = fakeClock();
+  const store = await new StateStore(join(dir, 'o4.json'), { flushDebounceMs: 5, now: clock.now }).init();
+  const mon = new StockMonitor({ inventory: {}, store, catalog, notifier: new Notifier({ hub: new EventHub() }), alertCooldownMs: 0, now: clock.now });
+  const watch = store.createWatch('s', { sku: 'MJY74CH/A', region: 'beijing' });
+  const reading = (status, at) => ({ sku: 'MJY74CH/A', region: 'beijing', fetchedAt: new Date(at).toISOString(), stores: [{ id: 'R320', name: '三里屯', status }] });
+  const t = clock.now();
+  mon.evaluate(watch, reading('unavailable', t));         // 基线
+  mon.evaluate(watch, reading('available', t + 20_000));  // 到货，报警 1
+  mon.evaluate(watch, reading('unavailable', t + 10_000)); // 迟到的旧读数
+  assert.equal(watch.lastStates.R320, 'available', '旧读数不得覆盖更新的基线');
+  mon.evaluate(watch, reading('available', t + 30_000));
+  assert.equal(store.listEvents('s').length, 1, '否则同一次到货会被再次宣布');
+  await store.close();
+});
+await test('新读数监听器抛错不影响查询本身', async () => {
+  const clock = fakeClock();
+  const inv = monitorFixture({ clock, responses: [SAMPLE] });
+  inv.onFresh(() => { throw new Error('listener bug'); });
+  const item = await inv.queryOne({ sku: 'MJY74CH/A', regionId: 'beijing' });
+  assert.equal(item.stores.length, 6);
+});
 
 // --------------------------------------------------------- scheduling ----
 group('自适应调度');
@@ -783,6 +848,22 @@ await test('长期无变化时逐步拉长间隔', () => {
   const quiet = mon.nextDelay();
   assert.equal(quiet.reason, 'steady-state');
   assert.ok(quiet.ms > mon.baseIntervalMs, '静默期应降低轮询频率');
+});
+await test('重启后不会直接跳到最慢间隔（lastTransitionAt 初始为 0）', () => {
+  const { mon } = schedulerFixture();
+  const next = mon.nextDelay();
+  assert.equal(next.reason, 'steady-state');
+  assert.equal(next.ms, mon.baseIntervalMs, '刚启动时静默时长应从启动时刻算起');
+});
+await test('有关注时静默期间隔不超过 quietMaxIntervalMs', () => {
+  const { mon, clock } = schedulerFixture();
+  clock.advance(12 * 60 * 60_000);
+  assert.equal(mon.nextDelay().ms, 60_000);
+  const custom = schedulerFixture({ quietMaxIntervalMs: 45_000 });
+  custom.clock.advance(12 * 60 * 60_000);
+  assert.equal(custom.mon.nextDelay().ms, 45_000);
+  const belowBase = schedulerFixture({ quietMaxIntervalMs: 5_000 });
+  assert.equal(belowBase.mon.nextDelay().ms, belowBase.mon.baseIntervalMs, '上限不得低于基准节奏');
 });
 
 
@@ -1118,6 +1199,85 @@ await test('推送失败进入重试，耗尽后落入死信', async () => {
   await new Promise(r => setTimeout(r, 400));
   assert.equal(attempts, 3, `应重试满 maxAttempts 次，实际 ${attempts} 次`);
   assert.equal(notifier.deadLetter.length, 1, '耗尽重试后必须落入死信');
+});
+await test('飞书：带签名发送，HTTP 200 但 code≠0 视为失败并重试', async () => {
+  const bodies = [];
+  const replies = [{ code: 19021, msg: 'sign match fail or timestamp is not within one hour from current time' }, { code: 0, msg: 'success' }];
+  const notifier = new Notifier({
+    hub: new EventHub(), feishuUrl: 'https://open.feishu.cn/open-apis/bot/v2/hook/abc', feishuSecret: 'sec',
+    maxAttempts: 3, timeoutMs: 100, retryBaseMs: 5
+  });
+  globalThis.fetch = async (url, init) => {
+    if (!String(url).includes('/bot/v2/hook/abc')) return { ok: true, status: 200, json: async () => ({ code: 0 }) };
+    bodies.push(JSON.parse(init.body));
+    const reply = replies.shift();
+    return { ok: true, status: 200, json: async () => reply };
+  };
+  notifier.send({ id: 'f1', sessionId: 's', productName: 'iPhone 18 Pro Max', capacity: '256GB', colorLabel: '银色', storeName: '三里屯', appleUrl: 'https://apple.example/buy' });
+  await new Promise(r => setTimeout(r, 300));
+  assert.equal(bodies.length, 2, '被飞书拒收的消息必须重试，而不是记为已发送');
+  const [channel] = notifier.snapshot().channels;
+  assert.equal(channel.sent, 1);
+  assert.equal(channel.failed, 1);
+  assert.match(channel.lastError, /FEISHU_REJECTED_19021/);
+  const body = bodies[1];
+  assert.equal(body.sign, feishuSign(body.timestamp, 'sec'), '签名必须按飞书算法生成');
+  assert.equal(body.msg_type, 'post');
+  assert.match(JSON.stringify(body.content), /三里屯/);
+  assert.match(JSON.stringify(body.content), /https:\/\/apple\.example\/buy/);
+});
+await test('Bark 默认响铃醒目：持续铃声 + 时效性通知', () => {
+  const event = { productName: 'p', capacity: '256GB', colorLabel: '银色', storeName: '三里屯', appleUrl: 'https://x' };
+  const payload = n => JSON.parse(n.channels[0].build(n.channels[0].url, event).init.body);
+
+  const loud = payload(new Notifier({ hub: new EventHub(), ...notifierOptionsFromEnv({ BARK_URL: 'https://api.day.app/k/' }) }));
+  assert.equal(loud.sound, 'alarm');
+  assert.equal(loud.call, '1', '默认应持续响铃');
+  assert.equal(loud.level, 'timeSensitive');
+  assert.equal(loud.volume, undefined, 'volume 只对 critical 生效');
+
+  const critical = new Notifier({ hub: new EventHub(), ...notifierOptionsFromEnv({ BARK_URL: 'https://api.day.app/k', BARK_LEVEL: 'critical', BARK_VOLUME: '7' }) });
+  assert.equal(payload(critical).level, 'critical');
+  assert.equal(payload(critical).volume, 7);
+
+  const quiet = payload(new Notifier({ hub: new EventHub(), ...notifierOptionsFromEnv({ BARK_URL: 'https://api.day.app/k', BARK_SOUND: '', BARK_CALL: '0', BARK_LEVEL: 'bogus' }) }));
+  assert.equal(quiet.sound, undefined, '留空则用系统默认铃声');
+  assert.equal(quiet.call, undefined);
+  assert.equal(quiet.level, 'timeSensitive', '无效级别回退为 timeSensitive');
+});
+await test('Bark 地址末尾多余的斜杠会被去掉', () => {
+  const notifier = new Notifier({ hub: new EventHub(), barkUrl: 'https://api.day.app/k//' });
+  assert.equal(notifier.channels[0].url, 'https://api.day.app/k');
+});
+await test('企业微信与 PushPlus：按各自响应体判定成败', async () => {
+  const seen = {};
+  const notifier = new Notifier({
+    hub: new EventHub(), wecomUrl: 'https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=k1', pushplusToken: 'tok',
+    maxAttempts: 1, timeoutMs: 100, retryBaseMs: 5
+  });
+  // Parse only this test's endpoints: notifiers from earlier tests may still be backing off
+  // and land here with non-JSON bodies.
+  globalThis.fetch = async (url, init) => {
+    if (String(url).includes('qyapi.weixin.qq.com')) {
+      seen.wecom = JSON.parse(init.body);
+      return { ok: true, status: 200, json: async () => ({ errcode: 93000, errmsg: 'invalid webhook url' }) };
+    }
+    if (String(url) === 'https://www.pushplus.plus/send') {
+      seen.pushplus = JSON.parse(init.body);
+      return { ok: true, status: 200, json: async () => ({ code: 200, msg: '请求成功' }) };
+    }
+    return { ok: true, status: 200, json: async () => ({}) };
+  };
+  notifier.send({ id: 'w1', sessionId: 's', productName: 'p', capacity: '1TB', colorLabel: '黑色', storeName: '王府井', appleUrl: 'https://x' });
+  await new Promise(r => setTimeout(r, 200));
+  const byName = Object.fromEntries(notifier.snapshot().channels.map(c => [c.name, c]));
+  assert.equal(byName.wecom.sent, 0, 'errcode≠0 不得记为已发送');
+  assert.match(byName.wecom.lastError, /WECOM_REJECTED_93000/);
+  assert.equal(byName.pushplus.sent, 1);
+  assert.equal(seen.wecom.msgtype, 'text', '企业微信用纯文本，微信插件里 markdown 显示不出来');
+  assert.match(seen.wecom.text.content, /王府井/);
+  assert.equal(seen.pushplus.token, 'tok');
+  assert.equal(notifier.deadLetter.filter(d => d.channel === 'wecom').length, 1);
 });
 await test('单个客户端写入异常不影响其他订阅者', () => {
   const hub = new EventHub();

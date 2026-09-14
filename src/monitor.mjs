@@ -28,6 +28,7 @@ export class StockMonitor {
     intervalMs = 30_000,
     minIntervalMs = 10_000,
     maxIntervalMs = 15 * MINUTE,
+    quietMaxIntervalMs = MINUTE,
     alertCooldownMs = 10 * MINUTE,
     stats = null,
     now = () => Date.now()
@@ -39,6 +40,9 @@ export class StockMonitor {
     this.baseIntervalMs = Math.max(minIntervalMs, intervalMs);
     this.minIntervalMs = minIntervalMs;
     this.maxIntervalMs = maxIntervalMs;
+    // Ceiling for the quiet steady state only. maxIntervalMs still governs idle, pre-launch
+    // and circuit-open sleeps, where nobody can be told about an arrival anyway.
+    this.quietMaxIntervalMs = Math.max(this.baseIntervalMs, quietMaxIntervalMs);
     this.alertCooldownMs = alertCooldownMs;
     this.stats = stats;
     this.now = now;
@@ -54,6 +58,7 @@ export class StockMonitor {
     this.nextRunAt = null;
     this.currentIntervalMs = this.baseIntervalMs;
     this.lastTransitionAt = 0;
+    this.createdAt = this.now();
     this.counters = { ticks: 0, requests: 0, alerts: 0, suppressed: 0, errors: 0, watchesChecked: 0 };
   }
 
@@ -131,9 +136,15 @@ export class StockMonitor {
       return { ms: this.baseIntervalMs, reason: 'recent-movement' };
     }
 
-    // Quiet upstream: widen gradually, capped. Halves pressure on Apple overnight.
-    const quietFactor = Math.min(6, 1 + Math.floor(sinceTransition / (20 * MINUTE)));
-    return { ms: Math.min(this.maxIntervalMs, this.baseIntervalMs * quietFactor), reason: 'steady-state' };
+    // Quiet upstream: widen gradually, but only to quietMaxIntervalMs. Apple never pushes,
+    // so every step wider is detection delay for someone who is waiting.
+    //
+    // Quiet time is measured from startup at the earliest. lastTransitionAt lives in memory
+    // and starts at 0, so without that floor a freshly restarted process would read as
+    // "quiet for decades" and jump straight to the widest interval.
+    const quietFor = now - Math.max(this.lastTransitionAt, this.createdAt);
+    const quietFactor = Math.min(6, 1 + Math.floor(quietFor / (20 * MINUTE)));
+    return { ms: Math.min(this.quietMaxIntervalMs, this.baseIntervalMs * quietFactor), reason: 'steady-state' };
   }
 
   start() {
@@ -259,6 +270,24 @@ export class StockMonitor {
   }
 
   /**
+   * Check watches against fresh readings the moment they are fetched, not at the next round.
+   *
+   * Apple never pushes, but the monitor is not the only thing polling it: every page
+   * refresh fetches too, and one request often harvests neighbouring cities in passing.
+   * Wired to InventoryService#onFresh, those readings reach watches for free — no extra
+   * upstream request. Rounds remain the guaranteed floor; this only makes detection earlier.
+   */
+  observe(readings) {
+    const byKey = new Map(readings.map(item => [`${item.sku}|${item.region}`, item]));
+    for (const watch of this.store.allWatches()) {
+      const item = byKey.get(`${watch.sku}|${watch.region}`);
+      if (!item) continue;
+      if (this.phase(watch.product || this.catalog.defaultProduct) === 'preorder-not-open') continue;
+      this.evaluate(watch, item);
+    }
+  }
+
+  /**
    * Compare a fresh reading against the stored baseline and alert on real arrivals.
    *
    * Rules, in order of importance:
@@ -295,6 +324,14 @@ export class StockMonitor {
       this.store.updateWatchSnapshot(watch.id, nextStates, checkedAt);
       return;
     }
+
+    // Rounds and observe() both feed this method, so readings can arrive out of order or
+    // twice (a round re-reads what its own harvest already delivered). An older reading
+    // would roll the baseline back and let the next one re-announce an arrival that was
+    // already sent, so it is dropped. An equal timestamp is let through: two concurrent
+    // requests can land in the same millisecond, and re-applying an identical reading is a
+    // no-op because the baseline already matches it.
+    if (watch.lastCheckedAt && Date.parse(checkedAt) < Date.parse(watch.lastCheckedAt)) return;
 
     // A stale reading describes the past; it must not manufacture a transition.
     if (item.stale) {

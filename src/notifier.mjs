@@ -1,3 +1,4 @@
+import { createHmac } from 'node:crypto';
 import { backoffDelay, sleep } from './resilience.mjs';
 import { logger } from './logger.mjs';
 
@@ -78,10 +79,16 @@ export class EventHub {
 
 /** One outbound push channel. */
 class Channel {
-  constructor(name, url, build) {
+  /**
+   * `check` inspects a 2xx response body. Chat-bot webhooks (Feishu, WeCom, PushPlus) answer
+   * HTTP 200 even when they reject the message — a bad signature, a missing keyword, a rate
+   * limit — so trusting the status alone would count a dropped alert as sent.
+   */
+  constructor(name, url, build, check = null) {
     this.name = name;
     this.url = url;
     this.build = build;
+    this.check = check;
     this.sent = 0;
     this.failed = 0;
     this.lastError = null;
@@ -91,9 +98,49 @@ class Channel {
     const { url, init } = this.build(this.url, event);
     const response = await fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
     if (!response.ok) throw new Error(`${this.name.toUpperCase()}_HTTP_${response.status}`);
+    if (this.check) {
+      const body = await response.json().catch(() => null);
+      const failure = this.check(body);
+      if (failure) throw new Error(`${this.name.toUpperCase()}_REJECTED_${failure}`);
+    }
     return true;
   }
 }
+
+const alertTitle = 'Pickup · 到货提醒';
+const alertLine = event => `${event.productName} ${event.capacity} ${event.colorLabel}\nApple ${event.storeName} 已显示可取货`;
+
+/** Feishu custom-bot signature: base64(HMAC-SHA256(key = "<timestamp>\n<secret>", message = "")). */
+export function feishuSign(timestamp, secret) {
+  return createHmac('sha256', `${timestamp}\n${secret}`).update('').digest('base64');
+}
+
+const BARK_LEVELS = new Set(['active', 'timeSensitive', 'passive', 'critical']);
+
+/** Channel options from environment variables — shared by the server and `npm run notify:test`. */
+export function notifierOptionsFromEnv(env = process.env) {
+  const volume = Number(env.BARK_VOLUME);
+  return {
+    barkUrl: env.BARK_URL || '',
+    barkSound: env.BARK_SOUND ?? 'shake',
+    barkCall: env.BARK_CALL !== '0',
+    barkLevel: env.BARK_LEVEL || 'timeSensitive',
+    barkVolume: Number.isFinite(volume) && env.BARK_VOLUME !== '' ? Math.min(10, Math.max(0, volume)) : 10,
+    ntfyUrl: env.NTFY_URL || '',
+    feishuUrl: env.FEISHU_WEBHOOK_URL || '',
+    feishuSecret: env.FEISHU_SECRET || '',
+    wecomUrl: env.WECOM_WEBHOOK_URL || '',
+    pushplusToken: env.PUSHPLUS_TOKEN || ''
+  };
+}
+
+/** Response-body verdicts: null when accepted, otherwise a short reason for lastError. */
+const feishuCheck = body => {
+  const code = body?.code ?? body?.StatusCode;
+  return code === 0 ? null : `${code ?? 'NO_BODY'}${body?.msg ? `_${body.msg}` : ''}`;
+};
+const wecomCheck = body => (body?.errcode === 0 ? null : `${body?.errcode ?? 'NO_BODY'}${body?.errmsg ? `_${body.errmsg}` : ''}`);
+const pushplusCheck = body => (body?.code === 200 ? null : `${body?.code ?? 'NO_BODY'}${body?.msg ? `_${body.msg}` : ''}`);
 
 /**
  * Notification dispatcher with a retrying, per-channel outbox.
@@ -108,7 +155,7 @@ class Channel {
  * drop alerts that were mid-retry.
  */
 export class Notifier {
-  constructor({ hub, store = null, barkUrl = '', ntfyUrl = '', maxAttempts = 4, timeoutMs = 6_000, maxQueue = 500, retryBaseMs = 500 } = {}) {
+  constructor({ hub, store = null, barkUrl = '', barkSound = 'alarm', barkCall = true, barkLevel = 'timeSensitive', barkVolume = 10, ntfyUrl = '', feishuUrl = '', feishuSecret = '', wecomUrl = '', pushplusToken = '', maxAttempts = 4, timeoutMs = 6_000, maxQueue = 500, retryBaseMs = 500 } = {}) {
     this.hub = hub;
     this.store = store;          // optional StateStore, for a durable outbox
     this.maxAttempts = maxAttempts;
@@ -123,17 +170,27 @@ export class Notifier {
 
     this.channels = [];
     if (barkUrl) {
-      this.channels.push(new Channel('bark', barkUrl, (url, event) => ({
+      // An arrival is gone within minutes, so the default is loud: a distinct ringtone that
+      // repeats for ~30s (call) and breaks through Focus (timeSensitive). "critical" goes
+      // further and rings even with the silent switch on; volume only applies to it.
+      const level = BARK_LEVELS.has(barkLevel) ? barkLevel : 'timeSensitive';
+      const loudness = {
+        ...(barkSound ? { sound: barkSound } : {}),
+        ...(barkCall ? { call: '1' } : {}),
+        level,
+        ...(level === 'critical' ? { volume: barkVolume } : {})
+      };
+      this.channels.push(new Channel('bark', barkUrl.replace(/\/+$/, ''), (url, event) => ({
         url,
         init: {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({
-            title: 'Pickup · 到货提醒',
-            body: `${event.productName} ${event.capacity} ${event.colorLabel}\nApple ${event.storeName} 已显示可取货`,
+            title: alertTitle,
+            body: alertLine(event),
             url: event.appleUrl,
             group: 'Pickup',
-            level: 'timeSensitive',
+            ...loudness,
             isArchive: 1
           })
         }
@@ -153,6 +210,66 @@ export class Notifier {
           body: `${event.productName} ${event.capacity} ${event.colorLabel} · Apple ${event.storeName} 已显示可取货`
         }
       })));
+    }
+    if (feishuUrl) {
+      this.channels.push(new Channel('feishu', feishuUrl, (url, event) => {
+        // Signed per attempt: Feishu rejects a timestamp more than an hour off, and a retry
+        // after a long backoff must not reuse the original one.
+        const timestamp = String(Math.floor(Date.now() / 1000));
+        const signature = feishuSecret ? { timestamp, sign: feishuSign(timestamp, feishuSecret) } : {};
+        return {
+          url,
+          init: {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              ...signature,
+              msg_type: 'post',
+              content: {
+                post: {
+                  zh_cn: {
+                    title: alertTitle,
+                    content: [
+                      [{ tag: 'text', text: alertLine(event) }],
+                      [{ tag: 'a', text: '打开 Apple 购买页', href: event.appleUrl }]
+                    ]
+                  }
+                }
+              }
+            })
+          }
+        };
+      }, feishuCheck));
+    }
+    if (wecomUrl) {
+      // Plain text rather than markdown: markdown bot messages do not render when read
+      // through WeChat's WeCom plugin.
+      this.channels.push(new Channel('wecom', wecomUrl, (url, event) => ({
+        url,
+        init: {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            msgtype: 'text',
+            text: { content: `${alertTitle}\n${alertLine(event)}\n${event.appleUrl}` }
+          })
+        }
+      }), wecomCheck));
+    }
+    if (pushplusToken) {
+      this.channels.push(new Channel('pushplus', 'https://www.pushplus.plus/send', (url, event) => ({
+        url,
+        init: {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            token: pushplusToken,
+            title: alertTitle,
+            content: `${alertLine(event)}\n${event.appleUrl}`,
+            template: 'txt'
+          })
+        }
+      }), pushplusCheck));
     }
   }
 

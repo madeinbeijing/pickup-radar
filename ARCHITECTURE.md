@@ -520,6 +520,9 @@ v1.1 已有：
 - Browser Notification：页面连接时系统通知
 - Bark：可选服务端离线通知
 - ntfy：可选服务端离线通知
+- 飞书群机器人：可选，支持签名校验
+- 企业微信群机器人：可选
+- PushPlus：可选，经公众号推送到个人微信
 
 公众产品应升级：
 
@@ -639,7 +642,7 @@ Notification      -> worker / queue
 1. **门店预约名额**。到店办理走 Apple Store app 的预约系统，各门店名额独立、每天上午放号，
    与手机库存是两份互相独立的稀缺资源。其接口为 App 私有，Web 端不可达，故本项目**不监控**
    名额，也不在 UI 上暗示监控。若要做，需先从 App 侧抓到真实请求。
-2. **Web Push（VAPID）**。当前离线推送依赖 Bark / ntfy，属自用方案。面向公众需标准 Web Push
+2. **Web Push（VAPID）**。当前离线推送依赖 Bark / ntfy / 飞书 / 企业微信 / PushPlus，均为全局配置的自用方案。面向公众需标准 Web Push
    或微信订阅消息，并与账号绑定。
 3. **多实例部署**。当前状态在单文件 JSON 中，监控为单进程 `setTimeout` 调度。横向扩展需要
    PostgreSQL + Redis（分布式锁选主，避免多个 worker 重复轮询 Apple）。

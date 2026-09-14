@@ -7,7 +7,7 @@ import { catalog, getRegion, getVariant, getProduct, launchPhase, productOfSku }
 import { InventoryService } from './src/inventory.mjs';
 import { StateStore } from './src/state-store.mjs';
 import { StockMonitor } from './src/monitor.mjs';
-import { EventHub, Notifier } from './src/notifier.mjs';
+import { EventHub, Notifier, notifierOptionsFromEnv } from './src/notifier.mjs';
 import { CoveragePlanner } from './src/coverage.mjs';
 import { logger } from './src/logger.mjs';
 import { StatsRecorder, summarize, ledger, dayKey } from './src/stats.mjs';
@@ -50,8 +50,7 @@ const hub = new EventHub();
 const notifier = new Notifier({
   hub,
   store: stateStore,          // durable outbox: a restart resumes pending pushes
-  barkUrl: process.env.BARK_URL || '',
-  ntfyUrl: process.env.NTFY_URL || ''
+  ...notifierOptionsFromEnv(process.env)
 }).restore();
 
 const monitor = new StockMonitor({
@@ -60,11 +59,16 @@ const monitor = new StockMonitor({
   catalog,
   notifier,
   intervalMs: Number(process.env.MONITOR_INTERVAL_MS || 30_000),
+  quietMaxIntervalMs: Number(process.env.MONITOR_QUIET_MAX_MS || 60_000),
   alertCooldownMs: Number(process.env.ALERT_COOLDOWN_MS || 10 * 60_000),
   stats
 });
 
-if (process.env.DISABLE_MONITOR !== '1') monitor.start();
+if (process.env.DISABLE_MONITOR !== '1') {
+  // Page refreshes and cross-city harvests reach watches as soon as they land.
+  inventory.onFresh(readings => monitor.observe(readings));
+  monitor.start();
+}
 
 const heartbeat = setInterval(() => hub.heartbeat(), 25_000);
 heartbeat.unref?.();
