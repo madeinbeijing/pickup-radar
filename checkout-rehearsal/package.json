@@ -1,0 +1,17 @@
+{
+  "name": "apple-checkout-rehearsal",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "login": "node checkout.mjs login",
+    "run": "node checkout.mjs run",
+    "check": "node --check checkout.mjs && node --check plan.mjs && node --check opening.mjs",
+    "test": "node --test plan.test.mjs opening.test.mjs"
+  },
+  "dependencies": {
+    "playwright": "1.63.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

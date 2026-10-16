@@ -1,0 +1,17 @@
+{
+  "productUrl": "https://www.apple.com.cn/shop/buy-iphone/iphone-duo",
+  "modelName": "iPhone Duo",
+  "color": "夜空色",
+  "capacities": ["256GB", "256GB"],
+  "storeCandidates": [
+    "Apple 三里屯",
+    "Apple 朝阳大悦城",
+    "Apple 华贸购物中心",
+    "Apple 王府井",
+    "Apple 西单大悦城",
+    "Apple 北京荟聚"
+  ],
+  "payment": "微信支付",
+  "expectedTotalCny": 31998,
+  "maxTotalCny": 32500
+}
