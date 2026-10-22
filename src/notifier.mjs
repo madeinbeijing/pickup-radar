@@ -195,7 +195,7 @@ export class Notifier {
           body: JSON.stringify({
             title: alertTitle,
             body: alertLine(event),
-            url: event.appleUrl,
+            url: 'applestore://',
             group: 'Pickup',
             ...loudness,
             isArchive: 1

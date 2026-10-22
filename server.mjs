@@ -65,6 +65,7 @@ const monitor = new StockMonitor({
   catalog,
   notifier,
   intervalMs: Number(process.env.MONITOR_INTERVAL_MS || 30_000),
+  minIntervalMs: Number(process.env.MONITOR_MIN_INTERVAL_MS || 10_000),
   quietMaxIntervalMs: Number(process.env.MONITOR_QUIET_MAX_MS || 60_000),
   alertCooldownMs: Number(process.env.ALERT_COOLDOWN_MS || 10 * 60_000),
   stats
