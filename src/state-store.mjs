@@ -35,6 +35,11 @@ export class StateStore {
     this.state = emptyState();
 
     this.dirty = false;
+    // Every mutation bumps `revision`; a successful write records the revision it serialized
+    // in `persistedRevision`. flushNow() waits until the revision current at its call is on
+    // disk — waiting for whatever write happens to be in flight is not enough (see flushNow).
+    this.revision = 0;
+    this.persistedRevision = 0;
     this.writing = null;
     this.timer = null;
     this.closed = false;
@@ -144,7 +149,13 @@ export class StateStore {
   /** Mark state dirty; the actual write is debounced and coalesced. */
   touch() {
     if (this.closed) return;
+    this.revision += 1;
     this.dirty = true;
+    this.schedule();
+  }
+
+  /** Arm the debounced background write, unless one is already armed. */
+  schedule() {
     if (this.timer) { this.stats.coalesced += 1; return; }
     // While the disk is failing, background retries back off instead of re-firing every
     // debounce period. Mutations keep landing in memory meanwhile; explicit flushNow()
@@ -154,9 +165,24 @@ export class StateStore {
     this.timer.unref?.();
   }
 
-  /** Atomic durable write. Serialized, and a failure never blocks future writes. */
+  /**
+   * Persist every mutation made before this call. Resolves `{ ok: true }` only once that
+   * revision is on disk, or `{ ok: false, error }` as soon as a write fails.
+   *
+   * A write already in flight serialized the state before the caller's latest mutations,
+   * so returning it would report them as saved when they are not. Reproduced: a write
+   * starts, the monitor is paused, close() resolves ok — and the file still says running.
+   */
   async flushNow() {
-    if (this.writing) return this.writing;
+    const target = this.revision;
+    for (;;) {
+      const result = await (this.writing || this.startWrite());
+      if (!result.ok || this.persistedRevision >= target) return result;
+    }
+  }
+
+  /** One atomic durable write of the current state. Serialized, and a failure never blocks future writes. */
+  startWrite() {
     if (this.timer) { clearTimeout(this.timer); this.timer = null; }
 
     const run = (async () => {
@@ -164,6 +190,7 @@ export class StateStore {
       this.dirty = false;
       const tmp = `${this.filePath}.tmp`;
       try {
+        const revision = this.revision;   // the snapshot below includes exactly this much
         const payload = JSON.stringify(this.state);
         const handle = await open(tmp, 'w');
         try {
@@ -173,6 +200,7 @@ export class StateStore {
           await handle.close();
         }
         await rename(tmp, this.filePath);
+        this.persistedRevision = Math.max(this.persistedRevision, revision);
         this.stats.writes += 1;
         this.stats.lastWriteMs = Date.now() - started;
         this.stats.lastWriteAt = new Date(this.now()).toISOString();
@@ -199,13 +227,12 @@ export class StateStore {
       return { ok: true };
     })();
 
-    this.writing = run;
-    try { return await run; }
-    finally {
+    this.writing = run.finally(() => {
       this.writing = null;
       // A mutation that landed mid-write still needs persisting.
-      if (this.dirty && !this.closed) this.touch();
-    }
+      if (this.dirty && !this.closed) this.schedule();
+    });
+    return this.writing;
   }
 
   /**

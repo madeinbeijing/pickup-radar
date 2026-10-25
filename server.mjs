@@ -332,9 +332,15 @@ async function handleApi(req, res, url) {
     if (changed) {
       stateStore.saveControl({ monitorPaused: monitor.paused, monitorPausedAt: monitor.pausedAt });
       // Persist now, not on the debounce: a crash right after "stop" must not resume polling.
-      await stateStore.flushNow();
+      const persisted = await stateStore.flushNow();
       log.info(monitor.paused ? 'monitor paused via api' : 'monitor resumed via api', { ip: clientIp(req) });
       hub.broadcast(monitorControl(), 'monitor');
+      if (!persisted.ok) {
+        // The switch took effect in memory but would not survive a restart; say so rather
+        // than report a success that a crash would quietly undo.
+        log.error('monitor control not persisted', { error: persisted.error });
+        return json(req, res, 500, { ...monitorControl(), ok: false, error: 'CONTROL_NOT_PERSISTED', detail: persisted.error });
+      }
     }
     return json(req, res, 200, monitorControl());
   }

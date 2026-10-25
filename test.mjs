@@ -535,6 +535,37 @@ await test('close() 在最终落盘失败时必须抛出（不能静默"成功�
   await assert.rejects(() => store.close(), /STATE_FLUSH_FAILED/,
     '落盘失败若被吞掉，调用方就无法用非零码退出，守护进程会把崩溃当成正常停止');
 });
+await test('写盘进行中又有修改：close() 必须等最新状态落盘（审阅 P1）', async () => {
+  const file = join(dir, 'inflight-close.json');
+  const store = await new StateStore(file, { flushDebounceMs: 5 }).init();
+  const first = store.flushNow();                 // a write starts; its snapshot predates the next line
+  store.saveControl({ monitorPaused: true });     // 用户在写盘途中按下「停止」
+  const result = await store.close();
+  await first;
+  assert.equal(result.ok, true);
+  const disk = JSON.parse(await readFile(file, 'utf8'));
+  assert.equal(disk.control.monitorPaused, true, 'close() 成功就意味着暂停已落盘，否则重启会恢复监控');
+  assert.equal(store.dirty, false);
+});
+await test('写盘进行中又有修改：flushNow() 返回时包含调用前的修改', async () => {
+  const file = join(dir, 'inflight-flush.json');
+  const store = await new StateStore(file, { flushDebounceMs: 5 }).init();
+  store.flushNow();
+  store.createWatch('s', { sku: 'MJY74CH/A', region: 'beijing' });
+  assert.equal((await store.flushNow()).ok, true);
+  const disk = JSON.parse(await readFile(file, 'utf8'));
+  assert.equal(disk.watches.length, 1, '暂停接口依赖这一点：返回成功时修改必须已在磁盘上');
+  await store.close();
+});
+await test('写盘持续失败时 flushNow() 立即返回失败，不会无限重试', async () => {
+  const store = await new StateStore(join(dir, 'inflight-fail.json'), { flushDebounceMs: 5 }).init();
+  store.filePath = '/nonexistent-dir-xyz/state.json';
+  store.flushNow();
+  store.createWatch('s', { sku: 'X', region: 'beijing' });
+  const result = await store.flushNow();
+  assert.equal(result.ok, false);
+  assert.equal(store.dirty, true, '未落盘的修改保持待写');
+});
 await test('flushNow 返回结果而非抛出，供后台去抖路径安全调用', async () => {
   const store = await new StateStore(join(dir, 'fl.json'), { flushDebounceMs: 5 }).init();
   assert.equal((await store.flushNow()).ok, true);
