@@ -9,6 +9,10 @@ const MAX_PACE_FACTOR = 32;
 // counts as stalled. Generous on purpose: a laptop waking from sleep fires late once.
 const STALL_GRACE_MS = 2 * MINUTE;
 const MAX_ROUND_MS = 5 * MINUTE;
+// Active polling cadences are measured from the start of a round, so a slow Apple response
+// does not stretch a 3s cadence into 3s + latency. Never closer than this between rounds.
+const ACTIVE_REASONS = new Set(['drop-window', 'recent-movement', 'steady-state']);
+const MIN_ROUND_GAP_MS = 200;
 
 /**
  * Adaptive stock monitor.
@@ -34,7 +38,7 @@ export class StockMonitor {
     minIntervalMs = 10_000,
     maxIntervalMs = 15 * MINUTE,
     quietMaxIntervalMs = MINUTE,
-    alertCooldownMs = 10 * MINUTE,
+    alertCooldownMs = 2 * MINUTE,
     stats = null,
     now = () => Date.now()
   } = {}) {
@@ -68,8 +72,8 @@ export class StockMonitor {
     this.currentIntervalMs = this.baseIntervalMs;
     this.lastTransitionAt = 0;
     this.createdAt = this.now();
-    // Throttle-aware pacing (AIMD): every throttled Apple response doubles the cadence,
-    // every clean round afterwards eases it back by 20%. Apple publishes no rate limit,
+    // Throttle-aware pacing: every throttled Apple response doubles the cadence, every clean
+    // round afterwards halves it again (32x back to 1x in 5 clean rounds, not ~15). Apple publishes no rate limit,
     // so the monitor has to find the fastest pace it tolerates rather than guess one.
     this.pace = { factor: 1, seenThrottled: 0, seenSuccessAt: null };
     // Outcome of the last round that actually polled. queryPlan never throws — it degrades
@@ -130,7 +134,7 @@ export class StockMonitor {
       pace.factor = Math.min(MAX_PACE_FACTOR, pace.factor * 2);
       log.warn('apple throttled, slowing down', { factor: pace.factor });
     } else if (successAt && successAt !== pace.seenSuccessAt && pace.factor > 1) {
-      pace.factor = Math.max(1, pace.factor * 0.8);
+      pace.factor = Math.max(1, pace.factor * 0.5);
     }
     pace.seenThrottled = throttled;
     pace.seenSuccessAt = successAt;
@@ -189,6 +193,16 @@ export class StockMonitor {
     return { ms: this.paced(Math.min(this.quietMaxIntervalMs, this.baseIntervalMs * quietFactor)), reason: 'steady-state' };
   }
 
+  /**
+   * Delay before the next round, given how long the last one took. Active cadences count
+   * from the round's start; idle, pre-launch and circuit-open sleeps are absolute waits.
+   */
+  afterRound(spentMs) {
+    const next = this.nextDelay();
+    if (!ACTIVE_REASONS.has(next.reason)) return next;
+    return { ms: Math.max(MIN_ROUND_GAP_MS, next.ms - Math.max(0, spentMs)), reason: next.reason };
+  }
+
   start() {
     if (!this.stopped || this.paused) return;
     this.stopped = false;
@@ -202,11 +216,12 @@ export class StockMonitor {
     this.nextRunAt = new Date(this.now() + ms).toISOString();
     this.scheduleReason = reason;
     this.timer = setTimeout(() => {
+      const roundStartedAt = this.now();
       this.tick()
         .catch(error => log.error('tick failed', { error: error.message }))
         .finally(() => {
           this.updatePace();
-          const next = this.nextDelay();
+          const next = this.afterRound(this.now() - roundStartedAt);
           this.schedule(next.ms, next.reason);
         });
     }, ms);
@@ -386,10 +401,17 @@ export class StockMonitor {
    *   boundary cannot spam the user.
    */
   evaluate(watch, item) {
-    const nextStates = {};
-    for (const store of item.stores) nextStates[store.id] = store.status;
-
     const baseline = watch.lastStates;
+    // A store Apple did not report this time (absent from the response, or the SKU missing)
+    // reads `unknown`. That says nothing about the shelf, so it must not overwrite the last
+    // known state — otherwise available → unknown → available re-announces stock that never
+    // left. A store never seen in a known state stays `unknown`, and its first real
+    // `available` is still a genuine arrival.
+    const nextStates = {};
+    for (const store of item.stores) {
+      const known = baseline?.[store.id];
+      nextStates[store.id] = store.status === 'unknown' && known && known !== 'unknown' ? known : store.status;
+    }
     const checkedAt = item.fetchedAt || new Date(this.now()).toISOString();
 
     if (!baseline) {

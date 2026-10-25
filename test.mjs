@@ -962,7 +962,7 @@ await test('被限流时间隔加倍，恢复后逐步缩回，且不超过最�
   assert.equal(mon.nextDelay().ms, base * 4, '没有新的成功也没有新的限流时保持不变');
   inventory.upstream.lastSuccessAt = 't1';
   mon.updatePace();
-  assert.equal(mon.nextDelay().ms, Math.round(base * 3.2), '成功一轮缩短 20%');
+  assert.equal(mon.nextDelay().ms, base * 2, '成功一轮减半');
   for (let i = 0; i < 20; i += 1) { inventory.upstream.lastSuccessAt = `t${i + 2}`; mon.updatePace(); }
   assert.equal(mon.nextDelay().ms, base, '持续成功后回到正常节奏');
 
@@ -1612,6 +1612,202 @@ await test('EventHub.broadcast 发给所有会话', () => {
   hub.add('b', { write: chunk => got.push(['b', chunk]) });
   assert.equal(hub.broadcast({ paused: true }, 'monitor'), 2);
   assert.ok(got.every(([, chunk]) => chunk.startsWith('event: monitor\n')));
+});
+
+// ------------------------------------------------- 2026-10-25 回归 ---
+group('到货判定与推送合并（2026-10-25 修复）');
+
+function evalHarness(file) {
+  const clock = fakeClock();
+  return (async () => {
+    const store = await new StateStore(join(dir, file), { flushDebounceMs: 5, now: clock.now }).init();
+    const mon = new StockMonitor({ inventory: {}, store, catalog, notifier: new Notifier({ hub: new EventHub() }), alertCooldownMs: 2 * 60_000, now: clock.now });
+    const watch = store.createWatch('s', { sku: 'MJY74CH/A', region: 'beijing', capacity: '256GB', color: 'silver' });
+    const feed = status => mon.evaluate(store.getWatch(watch.id), {
+      ok: true, stale: false, fetchedAt: new Date(clock.now()).toISOString(),
+      stores: [{ id: 'R320', name: '三里屯', status }]
+    });
+    return { clock, store, feed };
+  })();
+}
+
+await test('门店一轮缺席（unknown）不得把一直有货误报为到货', async () => {
+  const { clock, store, feed } = await evalHarness('r1.json');
+  feed('available');                 // 基线：有货
+  clock.advance(15 * 60_000); feed('available');
+  clock.advance(3_000); feed('unknown');      // Apple 这一轮漏了这家店
+  clock.advance(3_000); feed('available');    // 又出现，仍有货
+  assert.equal(store.listEvents('s').length, 0, '一直有货，不是到货');
+  assert.equal(store.getWatch(store.allWatches()[0].id).lastStates.R320, 'available', 'unknown 不得覆盖已知状态');
+  await store.close();
+});
+await test('无货 → 缺席 → 有货 仍然是真实到货', async () => {
+  const { clock, store, feed } = await evalHarness('r2.json');
+  feed('unavailable');
+  clock.advance(3_000); feed('unknown');
+  clock.advance(3_000); feed('available');
+  assert.equal(store.listEvents('s').length, 1);
+  assert.equal(store.listEvents('s')[0].previousStatus, 'unavailable', '上一个已知状态是无货');
+  await store.close();
+});
+await test('从未确认过的门店首次有货仍算到货', async () => {
+  const { clock, store, feed } = await evalHarness('r3.json');
+  feed('unknown');
+  clock.advance(3_000); feed('available');
+  assert.equal(store.listEvents('s').length, 1);
+  await store.close();
+});
+await test('单店冷却 2 分钟：卖完后很快补货也会提醒', async () => {
+  const { clock, store, feed } = await evalHarness('r4.json');
+  feed('unavailable');
+  clock.advance(3_000); feed('available');            // 提醒 1
+  clock.advance(60_000); feed('unavailable');          // 卖完
+  clock.advance(90_000); feed('available');            // 2.5 分钟后补货
+  assert.equal(store.listEvents('s').length, 2);
+  await store.close();
+});
+
+const arrival = (id, storeName, extra = {}) => ({
+  id, sessionId: 's', sku: 'MJY74CH/A', productName: 'iPhone 18 Pro Max', capacity: '256GB',
+  colorLabel: '银色', storeName, storeId: id, fetchedAt: new Date().toISOString(), appleUrl: 'https://x', ...extra
+});
+
+await test('推送冷却窗口内的到货不丢弃，窗口结束后合并成一条推送', async () => {
+  const bodies = [];
+  globalThis.fetch = async (url, init) => {
+    if (String(url).startsWith('https://bark.merge/')) bodies.push(JSON.parse(init.body).body);
+    return { ok: true, status: 200 };
+  };
+  const notifier = new Notifier({ hub: new EventHub(), barkUrl: 'https://bark.merge/k', pushCooldownMs: 300, retryBaseMs: 5, timeoutMs: 100 });
+  notifier.send(arrival('a1', '三里屯'));
+  await new Promise(r => setTimeout(r, 50));
+  notifier.send(arrival('a2', '王府井'));
+  notifier.send(arrival('a3', '王府井'));
+  notifier.send(arrival('a4', '西单大悦城'));
+  await new Promise(r => setTimeout(r, 100));
+  assert.equal(bodies.length, 1, '窗口内不应再推');
+  assert.equal(notifier.snapshot().deferred, 3);
+  await new Promise(r => setTimeout(r, 400));
+  assert.equal(bodies.length, 2, `窗口结束后应补发一条合并推送，实际 ${bodies.length}`);
+  assert.match(bodies[1], /王府井、西单大悦城/);
+  assert.equal(bodies[1].match(/王府井/g).length, 1, '同一门店只列一次');
+  assert.equal(notifier.snapshot().deferred, 0);
+});
+await test('所有渠道都失败的推送不占用冷却窗口', async () => {
+  let fail = true;
+  const delivered = [];
+  globalThis.fetch = async (url, init) => {
+    if (!String(url).startsWith('https://bark.fail/')) return { ok: true, status: 200 };
+    if (fail) { fail = false; return { ok: false, status: 500 }; }
+    delivered.push(JSON.parse(init.body).body);
+    return { ok: true, status: 200 };
+  };
+  const notifier = new Notifier({ hub: new EventHub(), barkUrl: 'https://bark.fail/k', pushCooldownMs: 60_000, maxAttempts: 1, retryBaseMs: 5, timeoutMs: 100 });
+  notifier.send(arrival('b1', '三里屯'));     // 唯一渠道失败 → 死信
+  notifier.send(arrival('b2', '王府井'));     // 发送中到达 → 暂存
+  await new Promise(r => setTimeout(r, 150));
+  assert.equal(delivered.length, 1, '第一条失败，窗口未被占用，暂存的到货应立即推出');
+  assert.match(delivered[0], /王府井/);
+});
+await test('暂存的推送随状态落盘，重启后补发', async () => {
+  const store = await new StateStore(join(dir, 'r-defer.json'), { flushDebounceMs: 5 }).init();
+  const sent = [];
+  globalThis.fetch = async (url, init) => {
+    if (String(url).startsWith('https://bark.restart/')) sent.push(JSON.parse(init.body).body);
+    return { ok: true, status: 200 };
+  };
+  const n1 = new Notifier({ hub: new EventHub(), store, barkUrl: 'https://bark.restart/k', pushCooldownMs: 60_000, timeoutMs: 100 });
+  n1.send(arrival('c1', '三里屯'));
+  await new Promise(r => setTimeout(r, 50));
+  n1.send(arrival('c2', '华贸购物中心'));
+  assert.equal(store.loadOutbox().deferred.length, 1, '暂存的到货必须落盘');
+  await store.close();
+  clearTimeout(n1.flushTimer);
+
+  const revived = await new StateStore(join(dir, 'r-defer.json')).init();
+  const n2 = new Notifier({ hub: new EventHub(), store: revived, barkUrl: 'https://bark.restart/k', pushCooldownMs: 60_000, timeoutMs: 100 });
+  n2.restore();
+  await new Promise(r => setTimeout(r, 100));
+  assert.equal(sent.length, 2);
+  assert.match(sent[1], /华贸购物中心/);
+  await revived.close();
+});
+await test('PUSH_ONLY_SKU：其它配置不推手机，但网页事件照常', async () => {
+  let calls = 0;
+  globalThis.fetch = async url => { if (String(url).startsWith('https://bark.only/')) calls += 1; return { ok: true, status: 200 }; };
+  const hub = new EventHub();
+  const seen = [];
+  hub.add('s', { write: chunk => seen.push(chunk) });
+  const notifier = new Notifier({ hub, barkUrl: 'https://bark.only/k', pushOnlySku: 'MJY74CH/A', timeoutMs: 100 });
+  notifier.send(arrival('d1', '三里屯', { sku: 'MJY64CH/A' }));
+  notifier.send(arrival('d2', '三里屯'));
+  await new Promise(r => setTimeout(r, 50));
+  assert.equal(calls, 1);
+  assert.equal(seen.length, 2);
+});
+
+group('提速：节奏计时与限流处理（2026-10-25）');
+await test('下一轮从上一轮开始算起：请求耗时不叠加到间隔上', () => {
+  const { mon } = schedulerFixture();
+  const plain = mon.nextDelay();
+  assert.equal(plain.reason, 'steady-state');
+  assert.equal(mon.afterRound(1_200).ms, plain.ms - 1_200);
+  assert.equal(mon.afterRound(10 * 60_000).ms, 200, '慢轮之后也留最小间隔，不会空转');
+});
+await test('熔断等待与空闲等待不扣减（它们是绝对等待）', () => {
+  const clock = fakeClock();
+  const mon = new StockMonitor({
+    inventory: { breaker: { state: 'open', retryAfterMs: () => 40_000 } },
+    store: { allWatches: () => [{ id: 'w' }] }, catalog, intervalMs: 3_000, minIntervalMs: 3_000, now: clock.now
+  });
+  assert.equal(mon.afterRound(2_000).ms, mon.nextDelay().ms);
+  assert.equal(mon.afterRound(2_000).reason, 'circuit-open');
+});
+await test('Apple 限流（541）不再打开熔断器，只放慢节奏', async () => {
+  const clock = fakeClock();
+  const inv = new InventoryService({
+    catalog, now: clock.now, retries: 0,
+    fetchImpl: async () => ({ ok: false, status: 541, headers: { get: () => null } })
+  });
+  for (let i = 0; i < 8; i += 1) {
+    await assert.rejects(inv.queryOne({ sku: 'MJY74CH/A', regionId: 'beijing' }));
+    clock.advance(3_000);
+  }
+  assert.equal(inv.counters.throttled, 8);
+  assert.equal(inv.breaker.state, 'closed', '限流不是故障，不得停查');
+});
+await test('真故障（5xx）仍然打开熔断器', async () => {
+  const clock = fakeClock();
+  const inv = new InventoryService({
+    catalog, now: clock.now, retries: 0,
+    fetchImpl: async () => ({ ok: false, status: 503, headers: { get: () => null } })
+  });
+  for (let i = 0; i < 4; i += 1) {
+    await assert.rejects(inv.queryOne({ sku: 'MJY74CH/A', regionId: 'beijing' }));
+    clock.advance(3_000);
+  }
+  assert.equal(inv.breaker.state, 'open');
+});
+await test('半开探针遇到限流会释放探针名额，熔断器不会卡死', () => {
+  const clock = fakeClock();
+  const breaker = new CircuitBreaker({ failureThreshold: 1, openMs: 1_000, now: clock.now });
+  breaker.onFailure(new Error('x'));
+  clock.advance(1_000);
+  assert.equal(breaker.tryAcquire(), true);
+  assert.equal(breaker.tryAcquire(), false, '探针名额已占用');
+  breaker.onNeutral();
+  assert.equal(breaker.tryAcquire(), true, '限流探针释放名额后可再探');
+  assert.equal(breaker.state, 'half-open');
+});
+await test('被限流时健康检查报 upstream-throttled（降级，仍为 200）', () => {
+  const verdict = assessHealth({
+    inventory: { circuit: { state: 'closed' }, upstream: {} },
+    monitor: { paused: false, stalled: false, lastError: null, failedRounds: 0, paceFactor: 4 },
+    state: {}, stats: {}, notifications: {}
+  });
+  assert.equal(verdict.status, 'degraded');
+  assert.equal(verdict.httpStatus, 200);
+  assert.ok(verdict.warnings.includes('upstream-throttled'));
 });
 
 await rm(dir, { recursive: true, force: true });

@@ -105,6 +105,14 @@ export class CircuitBreaker {
     if (this.failures >= this.failureThreshold) this.trip();
   }
 
+  /**
+   * An outcome that says nothing about upstream health (e.g. rate limiting). Only frees the
+   * probe slot, so a throttled half-open probe cannot wedge the breaker.
+   */
+  onNeutral() {
+    if (this.state === 'half-open') this.inFlightProbes = Math.max(0, this.inFlightProbes - 1);
+  }
+
   /** Open with exponential backoff so a persistently dead upstream is probed ever more rarely. */
   trip() {
     this.state = 'open';

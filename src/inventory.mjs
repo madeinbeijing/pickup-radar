@@ -286,7 +286,11 @@ export class InventoryService {
           this.counters.contractFailures += 1;
           log.error('upstream contract broken', { anchor, error: error.code, detail: error.contract.warning });
         }
-        this.breaker.onFailure(error);
+        // A throttle is not an outage: the monitor already slows down for it (pace factor).
+        // Counting it toward the breaker as well punished one 541 twice — doubled cadence AND
+        // up to minutes of not polling at all. Real faults (timeouts, 5xx, contract) still trip.
+        if (error?.throttled) this.breaker.onNeutral();
+        else this.breaker.onFailure(error);
         this.upstream.lastError = error?.code || error?.message || 'UPSTREAM_ERROR';
         this.upstream.lastErrorAt = new Date(this.now()).toISOString();
         throw error;

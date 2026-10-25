@@ -76,7 +76,7 @@ export class StateStore {
         events: Array.isArray(parsed.events) ? parsed.events : [],
         coverage: Array.isArray(parsed.coverage) ? parsed.coverage : [],
         outbox: parsed.outbox && typeof parsed.outbox === 'object'
-          ? { queue: parsed.outbox.queue || [], deadLetter: parsed.outbox.deadLetter || [] }
+          ? { queue: parsed.outbox.queue || [], deadLetter: parsed.outbox.deadLetter || [], deferred: parsed.outbox.deferred || [] }
           : { queue: [], deadLetter: [] },
         control: parsed.control && typeof parsed.control === 'object' ? parsed.control : {}
       };
@@ -370,7 +370,8 @@ export class StateStore {
   saveOutbox(outbox) {
     this.state.outbox = {
       queue: (outbox?.queue || []).map(({ key, channel, event, attempt }) => ({ key, channel, event, attempt })),
-      deadLetter: outbox?.deadLetter || []
+      deadLetter: outbox?.deadLetter || [],
+      deferred: outbox?.deferred || []
     };
     this.touch();
   }

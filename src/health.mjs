@@ -36,6 +36,8 @@ export function assessHealth({ inventory, monitor, state, stats, notifications, 
   if (stats?.writeFailing) warnings.push('stats-write-failing');
   if (!monitor.paused && monitor.lastRound?.errored && monitor.failedRounds < FAILED_ROUNDS_DOWN) warnings.push('round-partially-failed');
   if (inventory.upstream?.lastContractWarning) warnings.push('contract-partial');
+  // Throttled: still polling, but slower than configured — detection is delayed.
+  if (!monitor.paused && monitor.paceFactor > 1) warnings.push('upstream-throttled');
   const deadAt = Date.parse(notifications?.lastDeadLetterAt || '');
   if (Number.isFinite(deadAt) && now - deadAt < DEAD_LETTER_WINDOW_MS) warnings.push('notification-dead-lettered');
 

@@ -67,7 +67,7 @@ const monitor = new StockMonitor({
   intervalMs: Number(process.env.MONITOR_INTERVAL_MS || 30_000),
   minIntervalMs: Number(process.env.MONITOR_MIN_INTERVAL_MS || 10_000),
   quietMaxIntervalMs: Number(process.env.MONITOR_QUIET_MAX_MS || 60_000),
-  alertCooldownMs: Number(process.env.ALERT_COOLDOWN_MS || 10 * 60_000),
+  alertCooldownMs: Number(process.env.ALERT_COOLDOWN_MS || 2 * 60_000),
   stats
 });
 
@@ -231,6 +231,12 @@ async function primeWatch(watch) {
   if (phaseOf(watch.product) === 'preorder-not-open') return;
   try {
     const item = await inventory.queryOne({ sku: watch.sku, regionId: watch.region });
+    // A stale fallback describes the past. Adopting it as the baseline could either announce
+    // stock that was already there or swallow a real arrival; leave it to the next round.
+    if (item.stale) {
+      log.info('baseline priming skipped: only stale data', { watch: watch.id, ageMs: item.staleAgeMs });
+      return;
+    }
     const states = Object.fromEntries(item.stores.map(store => [store.id, store.status]));
     stateStore.updateWatchSnapshot(watch.id, states, item.fetchedAt);
   } catch (error) {
