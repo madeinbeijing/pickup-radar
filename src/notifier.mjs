@@ -279,7 +279,7 @@ export class Notifier {
     this.batch = null;           // { id, pending, delivered } — the gated push going out now
     this.deferred = [];          // arrivals held back by the window; merged and sent when it ends
     this.flushTimer = null;
-    this.draining = false;
+    this.draining = new Set();   // channel names whose drain loop is running
     this.deadLetter = [];
     this.lastError = null;
 
@@ -497,16 +497,28 @@ export class Notifier {
   }
 
   /**
-   * Drain the outbox one delivery at a time.
-   * A failure re-queues only that (event, channel) pair; siblings are untouched.
+   * Drain the outbox: one independent loop per channel.
+   *
+   * Channels never wait on each other. A single shared loop put one dead channel's timeout
+   * and backoff in front of every other channel's deliveries — measured: a hung ntfy held
+   * Bark's second arrival back 6.4s, and each retry re-queued at the back to block again.
+   * Within one channel deliveries stay in order. A failure re-queues only that
+   * (event, channel) pair; siblings are untouched.
    */
-  async drain() {
-    if (this.draining) return;
-    this.draining = true;
+  drain() {
+    const names = new Set(this.queue.map(job => job.channel));
+    return Promise.all([...names].map(name => this.drainChannel(name)));
+  }
+
+  async drainChannel(name) {
+    if (this.draining.has(name)) return;
+    this.draining.add(name);
     try {
-      while (this.queue.length) {
-        const job = this.queue.shift();
-        const channel = this.channelByName(job.channel);
+      for (;;) {
+        const index = this.queue.findIndex(job => job.channel === name);
+        if (index < 0) break;
+        const [job] = this.queue.splice(index, 1);
+        const channel = this.channelByName(name);
         if (!channel) { this.settleBatch(job, false); continue; }   // channel removed by config change
 
         // Hold the job while it is being delivered or backing off. A job that is only
@@ -544,7 +556,7 @@ export class Notifier {
         this.persist();
       }
     } finally {
-      this.draining = false;
+      this.draining.delete(name);
     }
   }
 

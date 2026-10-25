@@ -1426,6 +1426,31 @@ await test('已成功的渠道不得因其它渠道失败而重复发送（v2.2 
   assert.equal(notifier.deadLetter.length, 1, '只有失败的渠道进死信');
   assert.equal(notifier.deadLetter[0].channel, 'ntfy');
 });
+await test('卡死的渠道不得拖慢其它渠道（2026-10-25 实测 Bark 被拖 6.4s）', async () => {
+  const barkAt = [];
+  const started = Date.now();
+  globalThis.fetch = (url, init) => new Promise((resolve, reject) => {
+    if (String(url).startsWith('https://ntfy.hol/')) {
+      // Dead channel: never answers, only gives up when the per-delivery timeout aborts it.
+      init.signal.addEventListener('abort', () => reject(Object.assign(new Error('timeout'), { name: 'TimeoutError' })));
+      return;
+    }
+    if (String(url).startsWith('https://bark.hol/')) barkAt.push(Date.now() - started);
+    resolve({ ok: true, status: 200 });
+  });
+  const notifier = new Notifier({
+    hub: new EventHub(), barkUrl: 'https://bark.hol/k', ntfyUrl: 'https://ntfy.hol/t',
+    maxAttempts: 2, timeoutMs: 1_000, retryBaseMs: 5
+  });
+  const arrival = (id, storeName) => ({ id, sessionId: 's', productName: 'p', capacity: '256GB', colorLabel: '黑色', storeName, appleUrl: 'https://x' });
+  notifier.send(arrival('h1', '三里屯'));
+  await new Promise(r => setTimeout(r, 30));
+  notifier.send(arrival('h2', '王府井'));
+  await new Promise(r => setTimeout(r, 150));
+  assert.equal(barkAt.length, 2, `ntfy 卡住时 Bark 仍应立即送出第二条，实际只送出 ${barkAt.length} 条`);
+  assert.ok(barkAt[1] < 150, `第二条 Bark 延迟 ${barkAt[1]}ms`);
+  assert.ok(notifier.pending().some(job => job.channel === 'ntfy'), 'ntfy 仍在独立重试');
+});
 await test('发件箱可持久化并在重启后续投', async () => {
   const store = await new StateStore(join(dir, 'ob.json'), { flushDebounceMs: 5 }).init();
   const n1 = new Notifier({ hub: new EventHub(), store, ntfyUrl: 'https://ntfy.example/t', maxAttempts: 9, timeoutMs: 50, retryBaseMs: 10_000 });
