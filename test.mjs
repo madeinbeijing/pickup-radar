@@ -712,6 +712,44 @@ await test('到货记录检测间隔：本次读数与上一次读数之差', as
   assert.deepEqual(mon.health().detectionGapMs, { n: 1, p50: 45_000, p95: 45_000, last: 45_000 });
   await store.close();
 });
+await test('到货时基线、事件、投递任务总在同一次写盘中（不会只落一部分）', async () => {
+  const clock = fakeClock();
+  const store = await new StateStore(join(dir, 'm-atomic.json'), { flushDebounceMs: 5, now: clock.now }).init();
+  const inv = monitorFixture({ clock, responses: [NONE, SAMPLE] });
+  globalThis.fetch = () => new Promise(() => {});   // push never answers: the job stays pending
+  const notifier = new Notifier({ hub: new EventHub(), store, barkUrl: 'https://bark.atomic/k', timeoutMs: 60_000 });
+  const mon = new StockMonitor({ inventory: inv, store, catalog, notifier, alertCooldownMs: 0, now: clock.now });
+  store.createWatch('s', { sku: 'MJY74CH/A', region: 'beijing', capacity: '256GB', color: 'silver' });
+  await mon.tick();
+  await store.flushNow();
+  clock.advance(3_000);
+
+  // Capture the state snapshot of every write taken after the arrival.
+  const snapshots = [];
+  const realStringify = JSON.stringify;
+  JSON.stringify = function (value, ...rest) {
+    const out = realStringify.call(this, value, ...rest);
+    if (value === store.state) snapshots.push(JSON.parse(out));
+    return out;
+  };
+  try {
+    await mon.tick();
+    await new Promise(r => setTimeout(r, 30));
+    await store.flushNow();
+  } finally {
+    JSON.stringify = realStringify;
+  }
+  assert.ok(snapshots.length > 0);
+  for (const snap of snapshots) {
+    const advanced = Object.values(snap.watches[0].lastStates).includes('available');
+    const hasEvent = snap.events.length > 0;
+    const hasJob = snap.outbox.queue.length > 0;
+    assert.ok(advanced === hasEvent && hasEvent === hasJob,
+      `基线=${advanced} 事件=${hasEvent} 任务=${hasJob}：基线推进而任务未落盘，崩溃后这次到货就永久丢失`);
+  }
+  assert.ok(snapshots.at(-1).outbox.queue.length > 0, '最终落盘的状态里必须有待投递任务');
+  await store.close();
+});
 await test('Apple 改了状态字段：监控轮次算失败，健康检查报 down（端到端）', async () => {
   const clock = fakeClock();
   const store = await new StateStore(join(dir, 'm-renamed.json'), { flushDebounceMs: 5, now: clock.now }).init();
