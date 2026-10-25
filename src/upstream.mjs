@@ -70,6 +70,10 @@ const DEFAULT_HEADERS = {
  * Only retries idempotent reads on genuinely transient conditions (timeout, socket
  * error, 5xx other than throttling). Throttling (429, 541) and other 4xx fail
  * immediately: retrying cannot fix them and only adds load.
+ *
+ * `beforeAttempt(attempt)` runs before every HTTP attempt, retries included, and before
+ * the attempt's timeout starts — the place to take a rate-limit token and count requests,
+ * so a retry costs budget like any other request instead of slipping past it.
  */
 export async function fetchJson(url, {
   fetchImpl = fetch,
@@ -77,11 +81,13 @@ export async function fetchJson(url, {
   retries = 2,
   signal,
   random = Math.random,
+  beforeAttempt,
   onAttempt
 } = {}) {
   let lastError = null;
 
   for (let attempt = 0; attempt <= retries; attempt += 1) {
+    await beforeAttempt?.(attempt);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     timer.unref?.();

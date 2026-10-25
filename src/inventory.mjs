@@ -206,7 +206,9 @@ export class InventoryService {
     this.freshListeners = new Set();            // see onFresh()
 
     this.upstream = { lastSuccessAt: null, lastLatencyMs: null, lastError: null, lastErrorAt: null, lastContractWarning: null, lastParseError: null };
-    this.counters = { requests: 0, retries: 0, failures: 0, contractFailures: 0, contractWarnings: 0, parseErrors: 0, throttled: 0, cacheHits: 0, staleServed: 0, harvested: 0, coalesced: 0 };
+    // `queries` = logical cluster lookups; `requests` = actual HTTP attempts to Apple,
+    // retries included, so it matches the load Apple sees. `retries` = attempts beyond the first.
+    this.counters = { queries: 0, requests: 0, retries: 0, failures: 0, contractFailures: 0, contractWarnings: 0, parseErrors: 0, throttled: 0, cacheHits: 0, staleServed: 0, harvested: 0, coalesced: 0 };
   }
 
   cacheKey(sku, regionId) { return `${sku}|${regionId}`; }
@@ -264,23 +266,27 @@ export class InventoryService {
       if (!this.breaker.tryAcquire()) {
         throw new UpstreamError('CIRCUIT_OPEN', { retryable: false });
       }
-      await this.bucket.acquire(signal);
-      this.counters.requests += 1;
-      this.recorder?.count('appleRequests');
+      this.counters.queries += 1;
       log.debug('upstream request', { anchor, skus: skus.length });
 
       try {
-        const { data, latencyMs, attempts } = await fetchJson(this.buildUrl(anchor, skus), {
+        const { data, latencyMs } = await fetchJson(this.buildUrl(anchor, skus), {
           fetchImpl: this.fetchImpl,
           timeoutMs: this.config.timeoutMs,
           retries: this.config.retries,
           signal,
-          onAttempt: ({ ok, attempt }) => { if (!ok && attempt > 0) this.counters.retries += 1; }
+          // Every HTTP attempt — retries too — takes a token and is counted once. Taking one
+          // token per lookup let failing lookups send up to (1 + retries)x the configured rate.
+          beforeAttempt: async attempt => {
+            await this.bucket.acquire(signal);
+            this.counters.requests += 1;
+            this.recorder?.count('appleRequests');
+            if (attempt > 0) {
+              this.counters.retries += 1;
+              this.recorder?.count('appleRetries');
+            }
+          }
         });
-        if (attempts > 1) {
-          this.counters.retries += attempts - 1;
-          this.recorder?.count('appleRetries', attempts - 1);
-        }
 
         // A 200 with parseable JSON is NOT yet a success. Validate the contract we
         // actually depend on before telling the breaker and the health endpoint that
@@ -307,6 +313,12 @@ export class InventoryService {
         }
         return { data, storeIds: contract.storeIds, latencyMs, fetchedAt: new Date(this.now()).toISOString() };
       } catch (error) {
+        // Cancelled by our own caller (monitor stop or pause) while waiting for a token or
+        // mid-request: that says nothing about Apple, so it must not count toward the breaker.
+        if (signal?.aborted) {
+          this.breaker.onNeutral();
+          throw error;
+        }
         this.counters.failures += 1;
         this.recorder?.count('appleFailures');
         if (error?.throttled) this.counters.throttled += 1;   // read by the monitor's pacing

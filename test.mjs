@@ -984,6 +984,32 @@ await test('新读数监听器抛错不影响查询本身', async () => {
   assert.equal(item.stores.length, 6);
 });
 
+await test('每次真实 HTTP 尝试（含重试）都取令牌并计数（审阅 P1）', async () => {
+  const clock = fakeClock();   // frozen: the bucket never refills, so tokens spent are exact
+  let http = 0;
+  const inv = new InventoryService({
+    catalog, now: clock.now, retries: 2, burst: 6,
+    fetchImpl: async () => (++http <= 2 ? { ok: false, status: 500, headers: { get: () => null } } : okResponse(SAMPLE))
+  });
+  const before = inv.bucket.snapshot().tokens;
+  await inv.queryOne({ sku: 'MJY74CH/A', regionId: 'beijing' });
+  assert.equal(http, 3);
+  assert.equal(inv.counters.requests, 3, 'requests 应等于实际发出的 HTTP 请求');
+  assert.equal(inv.counters.retries, 2, '两次 500 之后成功，重试是 2 次');
+  assert.equal(inv.counters.queries, 1, '逻辑查询只有 1 次');
+  assert.equal(before - inv.bucket.snapshot().tokens, 3, '重试同样消耗令牌，不能绕过限速');
+});
+await test('调用方取消（监控停止）不计入熔断器', async () => {
+  const clock = fakeClock();
+  const inv = new InventoryService({ catalog, now: clock.now, retries: 0, burst: 1, refillPerSec: 0.001, fetchImpl: async () => okResponse(SAMPLE) });
+  await inv.queryOne({ sku: 'MJY74CH/A', regionId: 'beijing' });   // spends the only token
+  const controller = new AbortController();
+  const pending = inv.queryPlan(new Map([['shanghai', ['MJY74CH/A']]]), { signal: controller.signal });
+  setTimeout(() => controller.abort(), 20);                          // cancelled while waiting for a token
+  await pending;
+  assert.equal(inv.counters.failures, 0, '取消不是 Apple 故障');
+  assert.equal(inv.breaker.failures, 0);
+});
 await test('限流响应计入 throttled，供监控调速', async () => {
   const clock = fakeClock();
   let calls = 0;

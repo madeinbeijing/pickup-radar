@@ -349,6 +349,7 @@ async function handleApi(req, res, url) {
     const inv = inventory.health();
     const mon = monitor.health();
     const lines = [
+      `pickup_upstream_queries_total ${inv.counters.queries}`,
       `pickup_upstream_requests_total ${inv.counters.requests}`,
       `pickup_upstream_retries_total ${inv.counters.retries}`,
       `pickup_upstream_failures_total ${inv.counters.failures}`,
