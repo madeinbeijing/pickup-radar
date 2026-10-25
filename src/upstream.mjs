@@ -9,7 +9,8 @@ import { backoffDelay, sleep } from './resilience.mjs';
 // Throttle responses. Apple rate-limits with the non-standard 541 as well as 429. These
 // are NOT retried within the request: a retry seconds later is almost always throttled
 // again and only deepens the limit (measured: ~250 retries rescued a dozen requests).
-// They fail fast, feed the circuit breaker, and the monitor widens its cadence instead.
+// They fail fast and the monitor widens its cadence instead; they do not count toward the
+// circuit breaker (see InventoryService), which is reserved for real faults.
 export const THROTTLE_STATUSES = new Set([429, 541]);
 
 // 4xx codes worth retrying. Everything else in 4xx is a contract error that retrying

@@ -6,6 +6,12 @@ const log = logger.child({ mod: 'monitor' });
 
 const MINUTE = 60_000;
 const MAX_PACE_FACTOR = 32;
+// After a throttle, recovery halves quickly but stops this much slower than the pace that
+// was throttled, and holds there for PACE_HOLD_MS before going back to full speed. Without
+// the hold, halving lands straight back on the throttled pace and hits the limit again
+// every few rounds — and repeatedly tripping Apple's limit risks a longer block.
+const PACE_FLOOR_MARGIN = 1.25;
+const PACE_HOLD_MS = 10 * MINUTE;
 // How far past its due time a round may be (or how long one may run) before the scheduler
 // counts as stalled. Generous on purpose: a laptop waking from sleep fires late once.
 const STALL_GRACE_MS = 2 * MINUTE;
@@ -76,7 +82,8 @@ export class StockMonitor {
     // Throttle-aware pacing: every throttled Apple response doubles the cadence, every clean
     // round afterwards halves it again (32x back to 1x in 5 clean rounds, not ~15). Apple publishes no rate limit,
     // so the monitor has to find the fastest pace it tolerates rather than guess one.
-    this.pace = { factor: 1, seenThrottled: 0, seenSuccessAt: null };
+    // `floor` remembers just below where the limit was last hit, until `floorUntil`.
+    this.pace = { factor: 1, seenThrottled: 0, seenSuccessAt: null, floor: 1, floorUntil: 0 };
     // Outcome of the last round that actually polled. queryPlan never throws — it degrades
     // to `unknown` — so `lastError` alone would stay clean while every watch goes blind.
     this.lastRound = null;
@@ -135,10 +142,13 @@ export class StockMonitor {
     const successAt = this.inventory?.upstream?.lastSuccessAt ?? null;
     const pace = this.pace;
     if (throttled > pace.seenThrottled) {
+      pace.floor = Math.min(MAX_PACE_FACTOR, pace.factor * PACE_FLOOR_MARGIN);
+      pace.floorUntil = this.now() + PACE_HOLD_MS;
       pace.factor = Math.min(MAX_PACE_FACTOR, pace.factor * 2);
-      log.warn('apple throttled, slowing down', { factor: pace.factor });
+      log.warn('apple throttled, slowing down', { factor: pace.factor, holdAt: pace.floor });
     } else if (successAt && successAt !== pace.seenSuccessAt && pace.factor > 1) {
-      pace.factor = Math.max(1, pace.factor * 0.5);
+      const floor = this.now() < pace.floorUntil ? pace.floor : 1;
+      pace.factor = Math.max(floor, pace.factor * 0.5);
     }
     pace.seenThrottled = throttled;
     pace.seenSuccessAt = successAt;
@@ -541,6 +551,7 @@ export class StockMonitor {
       intervalReason: this.scheduleReason || null,
       baseIntervalMs: this.baseIntervalMs,
       paceFactor: Math.round(this.pace.factor * 100) / 100,
+      paceHoldUntil: this.now() < this.pace.floorUntil ? new Date(this.pace.floorUntil).toISOString() : null,
       running: this.running,
       stopped: this.stopped,
       paused: this.paused,

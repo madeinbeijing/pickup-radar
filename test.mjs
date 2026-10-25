@@ -963,7 +963,7 @@ function schedulerFixture(overrides = {}) {
 }
 await test('被限流时间隔加倍，恢复后逐步缩回，且不超过最长间隔', () => {
   const inventory = { breaker: { state: 'closed', retryAfterMs: () => 0 }, counters: { throttled: 0 }, upstream: { lastSuccessAt: null } };
-  const { mon } = schedulerFixture({ inventory });
+  const { mon, clock } = schedulerFixture({ inventory });
   const base = mon.nextDelay().ms;
 
   inventory.counters.throttled = 1;
@@ -977,13 +977,37 @@ await test('被限流时间隔加倍，恢复后逐步缩回，且不超过最�
   assert.equal(mon.nextDelay().ms, base * 4, '没有新的成功也没有新的限流时保持不变');
   inventory.upstream.lastSuccessAt = 't1';
   mon.updatePace();
-  assert.equal(mon.nextDelay().ms, base * 2, '成功一轮减半');
+  // Last throttle hit at 2x, so recovery halves 4x but stops at 2x * 1.25 = 2.5x.
+  assert.equal(mon.nextDelay().ms, base * 2.5, '成功一轮减半，但停在被限流节奏之下');
   for (let i = 0; i < 20; i += 1) { inventory.upstream.lastSuccessAt = `t${i + 2}`; mon.updatePace(); }
-  assert.equal(mon.nextDelay().ms, base, '持续成功后回到正常节奏');
+  assert.equal(mon.nextDelay().ms, base * 2.5, '保持期内不回到刚被限流的节奏');
+  assert.ok(mon.health().paceHoldUntil, '健康检查显示保持期');
+  clock.advance(10 * 60_000);
+  for (let i = 0; i < 20; i += 1) { inventory.upstream.lastSuccessAt = `u${i}`; mon.updatePace(); }
+  assert.equal(mon.nextDelay().ms, base, '保持期过后回到正常节奏');
+  assert.equal(mon.health().paceHoldUntil, null);
 
   for (let i = 0; i < 12; i += 1) { inventory.counters.throttled += 1; mon.updatePace(); }
   assert.equal(mon.nextDelay().ms, mon.maxIntervalMs, '再怎么限流也不超过最长间隔');
   assert.equal(mon.health().paceFactor, 32);
+});
+await test('在基准节奏被限流：一轮内恢复到 1.25 倍并保持，不再每隔几轮撞一次限流', () => {
+  const inventory = { breaker: { state: 'closed', retryAfterMs: () => 0 }, counters: { throttled: 0 }, upstream: { lastSuccessAt: null } };
+  const { mon, clock } = schedulerFixture({ inventory });
+  const base = mon.nextDelay().ms;
+  inventory.counters.throttled = 1;
+  mon.updatePace();
+  inventory.upstream.lastSuccessAt = 's1';
+  mon.updatePace();
+  assert.equal(mon.nextDelay().ms, base * 1.25, '一轮成功即回到被限流节奏的 1.25 倍');
+  clock.advance(9 * 60_000);
+  inventory.upstream.lastSuccessAt = 's2';
+  mon.updatePace();
+  assert.equal(mon.nextDelay().ms, base * 1.25, '10 分钟内保持');
+  clock.advance(60_000);
+  inventory.upstream.lastSuccessAt = 's3';
+  mon.updatePace();
+  assert.equal(mon.nextDelay().ms, base, '保持期满再回到全速');
 });
 await test('无关注时退到最长间隔', () => {
   const { mon } = schedulerFixture({ store: { allWatches: () => [] } });
