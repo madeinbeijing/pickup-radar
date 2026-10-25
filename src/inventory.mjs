@@ -20,6 +20,8 @@ const DEFAULTS = {
 
 const ENDPOINT = 'https://www.apple.com.cn/shop/retail/pickup-message';
 const STATUS_RANK = { available: 0, unavailable: 1, ineligible: 2, unknown: 3 };
+// pickupDisplay values normalizeStatus() can map. Anything else reads as `unknown`.
+const KNOWN_STATUSES = new Set(['available', 'unavailable', 'ineligible']);
 
 export function normalizeStatus(value) {
   if (value === 'available') return 'available';
@@ -110,14 +112,40 @@ export function validateContract(data, skus) {
     };
   }
 
+  // The SKU being present is not enough: its pickupDisplay must still be a value we can
+  // read. If Apple renamed it, every store would normalise to `unknown` while the round
+  // counts as checked and health stays green — blind with no alarm. Not one readable value
+  // across the whole response is a contract break; some unreadable values are a warning.
+  const unreadable = new Set();
+  let readable = 0;
+  for (const sku of resolved) {
+    for (const store of stores) {
+      const part = store?.partsAvailability?.[sku];
+      if (!part) continue;
+      if (KNOWN_STATUSES.has(part.pickupDisplay)) readable += 1;
+      else unreadable.add(String(part.pickupDisplay));
+    }
+  }
+  if (resolved.length && !readable) {
+    return {
+      ok: false,
+      error: 'APPLE_STATUS_UNRECOGNIZED',
+      warning: `no readable pickupDisplay for ${resolved.length} SKU(s); saw: ${[...unreadable].slice(0, 5).join(', ')}`
+    };
+  }
+
   const missing = requested.filter(sku => !resolved.includes(sku));
+  const warnings = [
+    missing.length ? `SKU not present in response: ${missing.join(', ')}` : null,
+    unreadable.size ? `unrecognised pickupDisplay: ${[...unreadable].slice(0, 5).join(', ')}` : null
+  ].filter(Boolean);
   return {
     ok: true,
-    partial: missing.length > 0,
+    partial: warnings.length > 0,
     storeIds,
     resolvedSkus: resolved,
     missingSkus: missing,
-    warning: missing.length ? `SKU not present in response: ${missing.join(', ')}` : null
+    warning: warnings.length ? warnings.join('; ') : null
   };
 }
 

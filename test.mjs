@@ -184,6 +184,25 @@ await test('畸形 200 必须触发熔断，不得记为成功（v2.2 真实缺�
   await inv.queryPlan(new Map([['shanghai', ['MJY74CH/A']]]));
   assert.notEqual(inv.breaker.state, 'closed', '连续契约失败必须打开熔断，而不是一直显示健康');
 });
+await test('状态值全部无法识别判为硬失败（审阅 P1：否则全部 unknown 而健康全绿）', () => {
+  const renamed = { pickupDisplay: 'pickup-ready-v2', messageTypes: { regular: {} } };
+  const r = validateContract(wrap([
+    { storeNumber: 'R320', partsAvailability: { 'A/A': renamed } },
+    { storeNumber: 'R448', partsAvailability: { 'A/A': { messageTypes: { regular: {} } } } }
+  ]), ['A/A']);
+  assert.equal(r.ok, false);
+  assert.equal(r.error, 'APPLE_STATUS_UNRECOGNIZED');
+  assert.match(r.warning, /pickup-ready-v2/);
+});
+await test('部分状态值无法识别只记警告：可能是 Apple 新增的合法状态', () => {
+  const r = validateContract(wrap([
+    { storeNumber: 'R320', partsAvailability: { 'A/A': PART } },
+    { storeNumber: 'R448', partsAvailability: { 'A/A': { pickupDisplay: 'reserve-only', messageTypes: { regular: {} } } } }
+  ]), ['A/A']);
+  assert.equal(r.ok, true);
+  assert.equal(r.partial, true);
+  assert.match(r.warning, /unrecognised pickupDisplay: reserve-only/);
+});
 await test('健康检查如实暴露契约状态', async () => {
   const inv = new InventoryService({
     catalog, retries: 0,
@@ -660,6 +679,22 @@ await test('到货记录检测间隔：本次读数与上一次读数之差', as
   const [event] = store.listEvents('s');
   assert.equal(event.previousCheckedAt, baselineAt, '事件带上一次读数时间');
   assert.deepEqual(mon.health().detectionGapMs, { n: 1, p50: 45_000, p95: 45_000, last: 45_000 });
+  await store.close();
+});
+await test('Apple 改了状态字段：监控轮次算失败，健康检查报 down（端到端）', async () => {
+  const clock = fakeClock();
+  const store = await new StateStore(join(dir, 'm-renamed.json'), { flushDebounceMs: 5, now: clock.now }).init();
+  const RENAMED = structuredClone(SAMPLE);
+  for (const s of RENAMED.body.stores) for (const part of Object.values(s.partsAvailability)) part.pickupDisplay = 'pickup-ready-v2';
+  const inv = monitorFixture({ clock, responses: [RENAMED] });
+  const mon = new StockMonitor({ inventory: inv, store, catalog, notifier: new Notifier({ hub: new EventHub() }), now: clock.now });
+  store.createWatch('s', { sku: 'MJY74CH/A', region: 'beijing', capacity: '256GB', color: 'silver' });
+  await mon.tick(); clock.advance(3_000);
+  await mon.tick();
+  assert.equal(mon.lastRound.checked, 0, '读不懂的响应不得算作已检查');
+  const verdict = assessHealth({ inventory: inv.health(), monitor: mon.health(), state: {}, stats: {}, notifications: {} });
+  assert.equal(verdict.httpStatus, 503, `应报故障，实际 ${verdict.status} ${verdict.problems.join(',')}`);
+  assert.equal(inv.counters.contractFailures, 2);
   await store.close();
 });
 await test('抖动被冷却窗口抑制', async () => {
