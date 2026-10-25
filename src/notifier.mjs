@@ -142,6 +142,30 @@ function postViaTunnelProxy(targetUrl, init, timeoutMs) {
   });
 }
 
+/**
+ * Rolling window of recent latency samples (ms), summarised as percentiles.
+ * Kept small and in memory: it answers "how fast is an alert reaching me right now",
+ * not a long-term history — the stats ledger already keeps that.
+ */
+export class LatencyWindow {
+  constructor(size = 100) {
+    this.size = size;
+    this.samples = [];
+  }
+
+  add(ms) {
+    if (!Number.isFinite(ms) || ms < 0) return;
+    this.samples.push(Math.round(ms));
+    if (this.samples.length > this.size) this.samples.shift();
+  }
+
+  snapshot() {
+    const sorted = [...this.samples].sort((a, b) => a - b);
+    const at = q => (sorted.length ? sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))] : null);
+    return { n: sorted.length, p50: at(0.5), p95: at(0.95), last: this.samples.at(-1) ?? null };
+  }
+}
+
 /** One outbound push channel. */
 class Channel {
   /**
@@ -160,6 +184,9 @@ class Channel {
     this.sent = 0;
     this.failed = 0;
     this.lastError = null;
+    // Delivered minus Apple reading (`fromRead`) and minus the alert being raised
+    // (`fromRaise`, i.e. time spent in the outbox including retries).
+    this.latency = { fromRead: new LatencyWindow(), fromRaise: new LatencyWindow() };
   }
 
   async deliver(event, timeoutMs) {
@@ -454,11 +481,16 @@ export class Notifier {
     this.drain();
   }
 
-  /** Send a gated push (one arrival, or several merged) and track it until it settles. */
-  startBatch(events) {
-    const event = events.length === 1
+  /**
+   * Send a gated push (one arrival, or several merged) and track it until it settles.
+   * `held` marks arrivals that waited out the cooldown on purpose, so their deliberate
+   * delay is not counted as delivery latency.
+   */
+  startBatch(events, { held = false } = {}) {
+    const merged = events.length === 1
       ? { ...events[0], id: events[0].id || `push-${this.now()}` }
       : mergeArrivals(events);
+    const event = held ? { ...merged, held: true } : merged;
     this.batch = { id: event.id, pending: this.channels.length, delivered: false };
     this.enqueue(event);
   }
@@ -487,7 +519,7 @@ export class Notifier {
       this.flushTimer = null;
       if (this.batch || !this.deferred.length) return;
       if (this.now() - this.lastPushAt < this.pushCooldownMs) return this.scheduleDeferred();
-      this.startBatch(this.deferred.splice(0));
+      this.startBatch(this.deferred.splice(0), { held: true });
     }, wait);
     this.flushTimer.unref?.();
   }
@@ -530,6 +562,7 @@ export class Notifier {
         try {
           await channel.deliver(job.event, this.timeoutMs);
           channel.sent += 1;
+          this.recordLatency(channel, job.event);
           this.inflight.delete(job.key);
           this.settleBatch(job, true);
           this.persist();
@@ -560,12 +593,26 @@ export class Notifier {
     }
   }
 
-  /** Mirror the outbox into durable state so a restart resumes instead of dropping. */
+  /**
+   * How long a delivered alert took to reach this channel. Skips events without timestamps
+   * (notify:test) and pushes held back by the cooldown, whose delay was deliberate.
+   */
+  recordLatency(channel, event) {
+    if (event.held) return;
+    const at = this.now();
+    const fromRead = at - Date.parse(event.fetchedAt || '');
+    const fromRaise = at - Date.parse(event.createdAt || '');
+    channel.latency.fromRead.add(fromRead);
+    channel.latency.fromRaise.add(fromRaise);
+    if (Number.isFinite(fromRead)) log.info('notification delivered', { channel: channel.name, store: event.storeName, fromReadMs: fromRead, fromRaiseMs: fromRaise });
+  }
+
   /** Everything not yet delivered: queued plus whatever is mid-flight or backing off. */
   pending() {
     return [...this.inflight.values(), ...this.queue];
   }
 
+  /** Mirror the outbox into durable state so a restart resumes instead of dropping. */
   persist() {
     this.store?.saveOutbox?.({ queue: this.pending(), deadLetter: this.deadLetter, deferred: this.deferred });
   }
@@ -594,7 +641,10 @@ export class Notifier {
     const byChannel = {};
     for (const job of this.pending()) byChannel[job.channel] = (byChannel[job.channel] || 0) + 1;
     return {
-      channels: this.channels.map(c => ({ name: c.name, sent: c.sent, failed: c.failed, lastError: c.lastError })),
+      channels: this.channels.map(c => ({
+        name: c.name, sent: c.sent, failed: c.failed, lastError: c.lastError,
+        latencyMs: { fromRead: c.latency.fromRead.snapshot(), fromRaise: c.latency.fromRaise.snapshot() }
+      })),
       queued: this.pending().length,
       inflight: this.inflight.size,
       queuedByChannel: byChannel,

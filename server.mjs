@@ -364,6 +364,18 @@ async function handleApi(req, res, url) {
       `pickup_watches_active ${stateStore.statsSnapshot().activeWatches}`,
       `pickup_stream_connections ${hub.count()}`
     ];
+    // Alert latency: detection gap (stock may have appeared anywhere inside it) and, per
+    // channel, delivered minus the Apple reading. Only emitted once a sample exists.
+    const gap = mon.detectionGapMs;
+    if (gap.n) lines.push(`pickup_detection_gap_ms{quantile="0.5"} ${gap.p50}`, `pickup_detection_gap_ms{quantile="0.95"} ${gap.p95}`);
+    for (const channel of notifier.snapshot().channels) {
+      const read = channel.latencyMs.fromRead;
+      if (!read.n) continue;
+      lines.push(
+        `pickup_alert_latency_ms{channel="${channel.name}",quantile="0.5"} ${read.p50}`,
+        `pickup_alert_latency_ms{channel="${channel.name}",quantile="0.95"} ${read.p95}`
+      );
+    }
     res.writeHead(200, { 'content-type': 'text/plain; version=0.0.4; charset=utf-8', 'cache-control': 'no-store', ...securityHeaders() });
     return res.end(lines.join('\n') + '\n');
   }

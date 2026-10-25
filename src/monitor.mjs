@@ -1,5 +1,6 @@
 import { logger } from './logger.mjs';
 import { getProduct, launchPhase, productOfSku } from './catalog.mjs';
+import { LatencyWindow } from './notifier.mjs';
 
 const log = logger.child({ mod: 'monitor' });
 
@@ -81,6 +82,9 @@ export class StockMonitor {
     this.lastRound = null;
     this.failedRounds = 0;      // consecutive polling rounds in which no watch resolved
     this.counters = { ticks: 0, requests: 0, alerts: 0, suppressed: 0, errors: 0, watchesChecked: 0 };
+    // Per arrival: time between the reading that showed stock and the reading before it.
+    // The stock may have appeared anywhere in that gap, so it bounds detection delay.
+    this.detectionGap = new LatencyWindow();
   }
 
   // ---- scheduling ----------------------------------------------------------
@@ -500,8 +504,10 @@ export class StockMonitor {
       product: watch.product || this.catalog.defaultProduct,
       productName: watch.productName || productOfSku(watch.sku)?.name || 'iPhone',
       appleUrl: watch.appleUrl,
-      fetchedAt: checkedAt
+      fetchedAt: checkedAt,
+      previousCheckedAt: watch.lastCheckedAt || null
     });
+    this.detectionGap.add(Date.parse(checkedAt) - Date.parse(watch.lastCheckedAt || ''));
 
     this.store.recordAlert(watch.id, store.id, this.now());
     this.lastTransitionAt = this.now();
@@ -546,6 +552,7 @@ export class StockMonitor {
       lastRound: this.lastRound,
       failedRounds: this.failedRounds,
       stalled: this.stalled(),
+      detectionGapMs: this.detectionGap.snapshot(),
       counters: { ...this.counters }
     };
   }

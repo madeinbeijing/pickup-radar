@@ -647,6 +647,21 @@ await test('unavailable → available 触发一次，且不重复触发', async 
   assert.equal(store.listEvents('s').length, 1, 'available → available 不得重复报警');
   await store.close();
 });
+await test('到货记录检测间隔：本次读数与上一次读数之差', async () => {
+  const clock = fakeClock();
+  const store = await new StateStore(join(dir, 'm2-gap.json'), { flushDebounceMs: 5, now: clock.now }).init();
+  const inv = monitorFixture({ clock, responses: [NONE, SAMPLE] });
+  const mon = new StockMonitor({ inventory: inv, store, catalog, notifier: new Notifier({ hub: new EventHub() }), now: clock.now });
+  store.createWatch('s', { sku: 'MJY74CH/A', region: 'beijing', capacity: '256GB', color: 'silver' });
+  await mon.tick();
+  const baselineAt = store.allWatches()[0].lastCheckedAt;
+  clock.advance(45_000);
+  await mon.tick();
+  const [event] = store.listEvents('s');
+  assert.equal(event.previousCheckedAt, baselineAt, '事件带上一次读数时间');
+  assert.deepEqual(mon.health().detectionGapMs, { n: 1, p50: 45_000, p95: 45_000, last: 45_000 });
+  await store.close();
+});
 await test('抖动被冷却窗口抑制', async () => {
   const clock = fakeClock();
   const store = await new StateStore(join(dir, 'm3.json'), { flushDebounceMs: 5, now: clock.now }).init();
@@ -1450,6 +1465,20 @@ await test('卡死的渠道不得拖慢其它渠道（2026-10-25 实测 Bark 被
   assert.equal(barkAt.length, 2, `ntfy 卡住时 Bark 仍应立即送出第二条，实际只送出 ${barkAt.length} 条`);
   assert.ok(barkAt[1] < 150, `第二条 Bark 延迟 ${barkAt[1]}ms`);
   assert.ok(notifier.pending().some(job => job.channel === 'ntfy'), 'ntfy 仍在独立重试');
+});
+await test('按渠道统计送达延迟；冷却窗口有意暂存的推送不计入', async () => {
+  const clock = fakeClock();
+  globalThis.fetch = async () => ({ ok: true, status: 200 });
+  const notifier = new Notifier({ hub: new EventHub(), barkUrl: 'https://bark.lat/k', timeoutMs: 100, now: clock.now });
+  const at = offset => new Date(clock.now() - offset).toISOString();
+  notifier.send({ id: 'l1', sessionId: 's', productName: 'p', capacity: '256GB', colorLabel: '黑色', storeName: '三里屯',
+    appleUrl: 'https://x', fetchedAt: at(1_500), createdAt: at(200) });
+  await new Promise(r => setTimeout(r, 20));
+  const [bark] = notifier.snapshot().channels;
+  assert.deepEqual(bark.latencyMs.fromRead, { n: 1, p50: 1_500, p95: 1_500, last: 1_500 }, '从 Apple 读数到送达');
+  assert.equal(bark.latencyMs.fromRaise.p50, 200, '从触发提醒到送达');
+  notifier.recordLatency(notifier.channels[0], { held: true, fetchedAt: at(60_000), createdAt: at(60_000) });
+  assert.equal(notifier.snapshot().channels[0].latencyMs.fromRead.n, 1, '暂存推送的延迟是有意的，不得计入');
 });
 await test('发件箱可持久化并在重启后续投', async () => {
   const store = await new StateStore(join(dir, 'ob.json'), { flushDebounceMs: 5 }).init();
